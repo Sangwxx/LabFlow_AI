@@ -1,0 +1,29 @@
+# Python 缓存
+__pycache__/
+*.py[cod]
+
+# 虚拟环境
+.venv/
+venv/
+
+# 工具缓存
+.pytest_cache/
+.ruff_cache/
+.tmp/
+.tools/
+pytest-cache-files-*/
+
+# 本地环境与敏感文件
+.env
+.codexrules
+.streamlit/secrets.toml
+
+# 本地数据与产物
+artifacts/
+reports/
+storage/
+tmp/
+
+# 系统文件
+.DS_Store
+Thumbs.db
