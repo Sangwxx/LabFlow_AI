@@ -1,5 +1,3 @@
-"""基于按需触发的 Plan-and-Execute / ReAct Agent。"""
-
 from __future__ import annotations
 
 import json
@@ -23,7 +21,7 @@ AgentEventHandler = Callable[[dict], None]
 
 
 class PlanAndExecutePlanner:
-    """我先拆计划，再把每一步交给执行器。"""
+    """先把问题拆成 2 到 3 步，让执行器按需推进。"""
 
     def __init__(self, llm_client: LLMClient) -> None:
         self._llm_client = llm_client
@@ -34,34 +32,26 @@ class PlanAndExecutePlanner:
         *,
         project_structure: str,
     ) -> ExecutionPlan:
-        """根据论文片段和文件树生成初始步骤。"""
-
         schema = {
             "rationale": "中文规划思路",
-            "steps": [
-                {
-                    "description": "中文步骤描述",
-                    "objective": "该步骤验证的目标",
-                }
-            ],
+            "steps": [{"description": "中文步骤", "objective": "目标"}],
         }
         payload = self._llm_client.generate_json(
             system_prompt="\n".join(
                 [
                     self._llm_client.get_react_agent_role_prompt(),
                     "你当前扮演 Planner。",
-                    "请把任务拆成 2 到 4 个步骤，步骤要可由工具执行。",
+                    "请把任务拆成 2 到 3 个可执行步骤。",
+                    "优先围绕模块职责、控制流程和算法思想拆解。",
+                    "不要把重点放在变量名映射上。",
                     f"只输出 JSON，格式为: {json.dumps(schema, ensure_ascii=False)}",
                 ]
             ),
-            user_prompt=f"""
-【论文片段标题】{paper_section.title}
-【论文片段内容】
-{paper_section.content}
-
-【项目文件树】
-{project_structure}
-""".strip(),
+            user_prompt=(
+                f"【论文片段】{paper_section.combined_text}\n\n"
+                f"【项目文件树】\n"
+                f"{project_structure or '当前未提供文件树。'}"
+            ),
             temperature=0.1,
             max_tokens=900,
         )
@@ -69,57 +59,56 @@ class PlanAndExecutePlanner:
             return self._fallback_plan()
 
         steps = self._normalize_steps(payload.get("steps"))
-        rationale = str(payload.get("rationale", "")).strip()
-        if not steps:
-            return self._fallback_plan(rationale=rationale)
-        return ExecutionPlan(steps=steps, rationale=rationale)
+        return ExecutionPlan(
+            steps=steps or self._fallback_plan().steps,
+            rationale=(
+                str(payload.get("rationale", "")).strip() or self._fallback_plan().rationale
+            ),
+        )
 
     def _normalize_steps(self, raw_steps: object) -> tuple[PlanStep, ...]:
-        """把模型返回的步骤收敛成稳定结构。"""
-
+        steps: list[PlanStep] = []
         if not isinstance(raw_steps, list):
             return ()
 
-        normalized_steps: list[PlanStep] = []
-        for index, raw_step in enumerate(raw_steps, start=1):
-            if isinstance(raw_step, dict):
-                description = str(raw_step.get("description", "")).strip()
-                objective = str(raw_step.get("objective", "")).strip()
+        for index, item in enumerate(raw_steps, start=1):
+            if isinstance(item, dict):
+                description = str(item.get("description", "")).strip()
+                objective = str(item.get("objective", "")).strip()
             else:
-                description = str(raw_step).strip()
+                description = str(item).strip()
                 objective = ""
-            if not description:
-                continue
-            normalized_steps.append(
-                PlanStep(
-                    step_id=str(index),
-                    description=description,
-                    objective=objective,
-                )
-            )
-        return tuple(normalized_steps)
+            if description:
+                steps.append(PlanStep(str(index), description, objective))
+        return tuple(steps)
 
-    def _fallback_plan(self, *, rationale: str = "") -> ExecutionPlan:
-        """给 Planner 一个稳定兜底。"""
-
+    def _fallback_plan(self) -> ExecutionPlan:
         return ExecutionPlan(
             steps=(
-                PlanStep("1", "扫描文件树，定位可能承载论文机制的模块", "缩小目标文件范围"),
-                PlanStep("2", "读取关键代码段，核对层结构、控制流程或损失组合", "确认实现链"),
-                PlanStep("3", "对照论文步骤与参数，输出最终实现链路分析", "形成结论"),
+                PlanStep(
+                    "1",
+                    "扫描文件树，定位可能承载论文机制的模块",
+                    "缩小目标文件范围",
+                ),
+                PlanStep(
+                    "2",
+                    "读取关键代码段，解释算法步骤如何落到实现中",
+                    "确认实现链",
+                ),
+                PlanStep(
+                    "3",
+                    "若本地未见核心源码，则切换到学术解释模式",
+                    "保证输出不断流",
+                ),
             ),
-            rationale=rationale or "先定位模块，再读代码，最后核对论文逻辑。",
+            rationale="先定位模块，再解释实现；如果本地缺源码，就把论文讲清楚。",
         )
 
 
 class PlanAndExecuteExecutor:
-    """我负责执行 Planner 给出的单个步骤。"""
+    """执行单步计划，按需调用工具并记录 Thought/Action/Observation。"""
 
-    def __init__(
-        self,
-        llm_client: LLMClient,
-        evidence_builder: EvidenceBuilder,
-    ) -> None:
+    def __init__(self, llm_client: LLMClient, evidence_builder: EvidenceBuilder) -> None:
         self._llm_client = llm_client
         self._evidence_builder = evidence_builder
 
@@ -134,8 +123,6 @@ class PlanAndExecuteExecutor:
         event_handler: AgentEventHandler | None = None,
         max_actions: int = 3,
     ) -> tuple[StepExecutionTrace, tuple[AlignmentCandidate, ...]]:
-        """对单步任务跑 1 到 3 轮 Thought -> Action -> Observation。"""
-
         tool_invocations: list[ToolInvocation] = []
         latest_candidates = current_candidates
         thought = ""
@@ -164,7 +151,12 @@ class PlanAndExecuteExecutor:
                 }
 
             thought = str(payload.get("thought", "继续核查实现链。")).strip()
-            self._emit(event_handler, kind="thought", message=thought, step=step.display_text)
+            self._emit(
+                event_handler,
+                kind="thought",
+                message=thought,
+                step=step.display_text,
+            )
 
             action = str(payload.get("action", "finish")).strip()
             action_input = payload.get("action_input", {})
@@ -224,8 +216,6 @@ class PlanAndExecuteExecutor:
         )
 
     def list_project_structure(self, project_structure: str) -> str:
-        """返回项目树。"""
-
         return project_structure or "当前代码目录为空。"
 
     def read_code_segment(
@@ -236,29 +226,22 @@ class PlanAndExecuteExecutor:
         line_start: int,
         line_end: int,
     ) -> tuple[str, tuple[str, ...]]:
-        """精确读取代码段。"""
-
         for evidence in code_evidences:
             if evidence.file_name != path:
                 continue
             if evidence.start_line <= line_start and evidence.end_line >= line_end:
-                relative_start = max(line_start - evidence.start_line, 0)
-                relative_end = line_end - evidence.start_line + 1
-                snippet = "\n".join(
-                    evidence.code_snippet.splitlines()[relative_start:relative_end]
-                ).strip()
-                return (
-                    snippet or evidence.code_snippet,
-                    (self._candidate_id_from_evidence(evidence),),
+                start = max(line_start - evidence.start_line, 0)
+                end = line_end - evidence.start_line + 1
+                snippet = "\n".join(evidence.code_snippet.splitlines()[start:end]).strip()
+                return snippet or evidence.code_snippet, (
+                    self._candidate_id_from_evidence(evidence),
                 )
 
         for evidence in code_evidences:
             if evidence.file_name == path:
-                return (
-                    evidence.code_snippet,
-                    (self._candidate_id_from_evidence(evidence),),
-                )
-        return ("没有找到指定代码段。", ())
+                return evidence.code_snippet, (self._candidate_id_from_evidence(evidence),)
+
+        return "没有找到指定代码段。", ()
 
     def llm_semantic_search(
         self,
@@ -268,8 +251,6 @@ class PlanAndExecuteExecutor:
         code_evidences: tuple[CodeEvidence, ...],
         top_k: int = 4,
     ) -> tuple[str, tuple[AlignmentCandidate, ...]]:
-        """按需做语义搜索，不提前全量索引。"""
-
         synthetic_section = PaperSection(
             title=paper_section.title,
             content=query,
@@ -277,102 +258,32 @@ class PlanAndExecuteExecutor:
             page_number=paper_section.page_number,
             order=paper_section.order,
         )
-        heuristic_candidates = self._evidence_builder.build_alignment_candidates_from_inputs(
+        candidates = self._evidence_builder.build_alignment_candidates_from_inputs(
             paper_sections=(synthetic_section,),
             code_evidences=code_evidences,
-            top_k=1,
+            top_k=max(2, top_k),
         )
-        if not heuristic_candidates:
-            return ("语义搜索没有找到相关代码。", ())
+        if not candidates:
+            return "语义搜索没有找到相关代码。", ()
 
-        shortlisted = self._shortlist_candidates(heuristic_candidates, top_k=top_k)
-        rerank_payload = self._llm_client.generate_json(
-            system_prompt="\n".join(
-                [
-                    self._llm_client.get_react_agent_role_prompt(),
-                    "你正在执行 llm_semantic_search 工具。",
-                    "请从候选代码里选出最可能与查询语义相关的前若干项。",
-                    '只输出 JSON，格式为 {"selected_indexes": [0, 1, ...]}。',
-                ]
-            ),
-            user_prompt=self._build_search_rerank_prompt(query, shortlisted),
-            temperature=0.1,
-            max_tokens=500,
-        )
-        if not isinstance(rerank_payload, dict):
-            rerank_payload = {"selected_indexes": list(range(min(top_k, len(shortlisted))))}
-
-        selected_indexes = rerank_payload.get("selected_indexes", [])
-        selected_candidates: list[AlignmentCandidate] = []
-        if isinstance(selected_indexes, list):
-            for raw_index in selected_indexes:
-                try:
-                    index = int(raw_index)
-                except (TypeError, ValueError):
-                    continue
-                if 0 <= index < len(shortlisted):
-                    candidate = shortlisted[index]
-                    if candidate not in selected_candidates:
-                        selected_candidates.append(candidate)
-
-        if not selected_candidates:
-            selected_candidates = list(shortlisted[:top_k])
-
-        observation_lines = []
-        for candidate in selected_candidates:
-            observation_lines.append(
-                " | ".join(
-                    [
-                        candidate.code_evidence.file_name,
-                        f"L{candidate.code_evidence.start_line}-L{candidate.code_evidence.end_line}",
-                        f"召回分 {candidate.retrieval_score}",
-                    ]
-                )
-            )
-        return ("\n".join(observation_lines), tuple(selected_candidates))
-
-    def _shortlist_candidates(
-        self,
-        heuristic_candidates: tuple[AlignmentCandidate, ...],
-        *,
-        top_k: int,
-    ) -> tuple[AlignmentCandidate, ...]:
-        """按代码段去重，保留最值得让模型再判断的候选。"""
-
-        deduplicated: dict[str, AlignmentCandidate] = {}
-        for candidate in heuristic_candidates:
+        dedup: dict[str, AlignmentCandidate] = {}
+        for candidate in candidates:
             candidate_id = self._candidate_id(candidate)
-            previous = deduplicated.get(candidate_id)
-            if previous is None or candidate.retrieval_score > previous.retrieval_score:
-                deduplicated[candidate_id] = candidate
-        ordered = sorted(deduplicated.values(), key=lambda item: item.retrieval_score, reverse=True)
-        return tuple(ordered[:top_k])
+            if (
+                candidate_id not in dedup
+                or candidate.retrieval_score > dedup[candidate_id].retrieval_score
+            ):
+                dedup[candidate_id] = candidate
 
-    def _build_search_rerank_prompt(
-        self,
-        query: str,
-        candidates: tuple[AlignmentCandidate, ...],
-    ) -> str:
-        """给语义搜索工具做一次小范围 LLM 重排。"""
-
-        candidate_blocks = []
-        for index, candidate in enumerate(candidates):
-            candidate_blocks.append(
-                f"""
-[候选 {index}]
-文件: {candidate.code_evidence.file_name}
-范围: L{candidate.code_evidence.start_line}-L{candidate.code_evidence.end_line}
-代码:
-{candidate.code_evidence.code_snippet}
-                """.strip()
-            )
-        return f"""
-【搜索查询】
-{query}
-
-【候选代码】
-{chr(10).join(candidate_blocks)}
-""".strip()
+        ordered = tuple(
+            sorted(
+                dedup.values(),
+                key=lambda item: item.retrieval_score,
+                reverse=True,
+            )[:top_k]
+        )
+        lines = [self._format_candidate_summary(candidate) for candidate in ordered]
+        return "\n".join(lines), ordered
 
     def _invoke_tool(
         self,
@@ -384,15 +295,12 @@ class PlanAndExecuteExecutor:
         code_evidences: tuple[CodeEvidence, ...],
         current_candidates: tuple[AlignmentCandidate, ...],
     ) -> tuple[dict, tuple[AlignmentCandidate, ...]]:
-        """执行一次工具调用。"""
-
         if action == "list_project_structure":
-            observation = self.list_project_structure(project_structure)
             return (
                 {
                     "tool_name": "list_project_structure",
                     "tool_input": "查看项目结构",
-                    "observation": observation,
+                    "observation": self.list_project_structure(project_structure),
                 },
                 current_candidates,
             )
@@ -408,91 +316,50 @@ class PlanAndExecuteExecutor:
                 line_start=line_start,
                 line_end=line_end,
             )
-            merged_candidates = self._merge_selected_candidates(current_candidates, candidate_ids)
+            selected = [
+                candidate
+                for candidate in current_candidates
+                if self._candidate_id(candidate) in set(candidate_ids)
+            ]
             return (
                 {
                     "tool_name": "read_code_segment",
                     "tool_input": f"{path}:{line_start}-{line_end}",
                     "observation": observation,
                 },
-                merged_candidates,
+                tuple(selected or current_candidates),
             )
 
         params = action_input if isinstance(action_input, dict) else {}
         query = str(params.get("query", "")).strip() or paper_section.combined_text
-        observation, searched_candidates = self.llm_semantic_search(
+        observation, searched = self.llm_semantic_search(
             query=query,
             paper_section=paper_section,
             code_evidences=code_evidences,
             top_k=4,
         )
-        merged_candidates = self._merge_candidates(current_candidates, searched_candidates)
         return (
             {
                 "tool_name": "llm_semantic_search",
                 "tool_input": query,
                 "observation": observation,
             },
-            merged_candidates,
+            searched or current_candidates,
         )
 
-    def _merge_selected_candidates(
-        self,
-        current_candidates: tuple[AlignmentCandidate, ...],
-        candidate_ids: tuple[str, ...],
-    ) -> tuple[AlignmentCandidate, ...]:
-        """从已选候选里筛出被 read_code 命中的项。"""
-
-        if not candidate_ids:
-            return current_candidates
-        candidate_id_set = set(candidate_ids)
-        selected = [
-            candidate
-            for candidate in current_candidates
-            if self._candidate_id(candidate) in candidate_id_set
-        ]
-        return tuple(selected or current_candidates)
-
-    def _merge_candidates(
-        self,
-        current_candidates: tuple[AlignmentCandidate, ...],
-        new_candidates: tuple[AlignmentCandidate, ...],
-    ) -> tuple[AlignmentCandidate, ...]:
-        """合并新旧候选。"""
-
-        merged: dict[str, AlignmentCandidate] = {}
-        for candidate in (*current_candidates, *new_candidates):
-            candidate_id = self._candidate_id(candidate)
-            previous = merged.get(candidate_id)
-            if previous is None or candidate.retrieval_score > previous.retrieval_score:
-                merged[candidate_id] = candidate
-        ordered = sorted(merged.values(), key=lambda item: item.retrieval_score, reverse=True)
-        return tuple(ordered[:6])
-
-    def _candidate_id(self, candidate: AlignmentCandidate) -> str:
-        """稳定标识候选代码段。"""
-
-        return self._candidate_id_from_evidence(candidate.code_evidence)
-
-    def _candidate_id_from_evidence(self, evidence: CodeEvidence) -> str:
-        """稳定标识代码证据。"""
-
-        return f"{evidence.file_name}:{evidence.start_line}-{evidence.end_line}"
-
     def _build_executor_system_prompt(self) -> str:
-        """告诉 Executor 如何做 Thought / Action / Observation。"""
-
         schema = {
             "thought": "当前步骤的思考",
             "action": "list_project_structure | read_code_segment | llm_semantic_search | finish",
             "action_input": "对象形式的工具入参",
-            "final_observation": "当 action=finish 时，给出这一步的结论观察",
+            "final_observation": "当 action=finish 时的阶段结论",
         }
         return "\n".join(
             [
                 self._llm_client.get_react_agent_role_prompt(),
                 "你当前扮演 Executor。",
                 "你必须先给出 Thought，再选择一个 Action。",
+                "Thought 要解释为什么这样查，不要只重复变量名。",
                 f"只输出 JSON，格式为: {json.dumps(schema, ensure_ascii=False)}",
             ]
         )
@@ -506,56 +373,56 @@ class PlanAndExecuteExecutor:
         current_candidates: tuple[AlignmentCandidate, ...],
         tool_invocations: tuple[ToolInvocation, ...],
     ) -> str:
-        """给 Executor 当前步骤、候选和历史动作。"""
-
-        candidate_lines = []
-        for index, candidate in enumerate(current_candidates[:4]):
-            candidate_lines.append(
-                " | ".join(
-                    [
-                        f"候选 {index}",
-                        candidate.code_evidence.file_name,
-                        f"L{candidate.code_evidence.start_line}-L{candidate.code_evidence.end_line}",
-                        f"召回分 {candidate.retrieval_score}",
-                    ]
-                )
+        candidates = (
+            "\n".join(
+                self._format_candidate_summary(candidate, index)
+                for index, candidate in enumerate(current_candidates[:4])
             )
-
-        history_lines = []
-        for invocation in tool_invocations:
-            history_lines.extend(
+            or "暂无候选"
+        )
+        history = (
+            "\n".join(
                 [
-                    f"工具: {invocation.tool_name}",
-                    f"输入: {invocation.tool_input}",
-                    f"观察: {invocation.observation}",
+                    f"工具: {item.tool_name}\n输入: {item.tool_input}\n观察: {item.observation}"
+                    for item in tool_invocations
                 ]
             )
+            or "无"
+        )
+        return (
+            f"【步骤】{step.display_text}\n"
+            f"【论文片段】{paper_section.combined_text}\n\n"
+            f"【项目结构】\n{project_structure}\n\n"
+            f"【当前候选】\n{candidates}\n\n"
+            f"【已执行历史】\n{history}"
+        )
 
-        return f"""
-【步骤】{step.display_text}
-【论文片段标题】{paper_section.title}
-【论文片段内容】
-{paper_section.content}
+    def _format_candidate_summary(
+        self,
+        candidate: AlignmentCandidate,
+        index: int | None = None,
+    ) -> str:
+        prefix = f"候选 {index} | " if index is not None else ""
+        evidence = candidate.code_evidence
+        return (
+            f"{prefix}{evidence.file_name} | "
+            f"L{evidence.start_line}-L{evidence.end_line} | "
+            f"召回分 {candidate.retrieval_score}"
+        )
 
-【项目结构】
-{project_structure}
+    def _candidate_id(self, candidate: AlignmentCandidate) -> str:
+        return self._candidate_id_from_evidence(candidate.code_evidence)
 
-【当前候选】
-{chr(10).join(candidate_lines) or "暂无候选"}
-
-【已执行历史】
-{chr(10).join(history_lines) or "无"}
-""".strip()
+    def _candidate_id_from_evidence(self, evidence: CodeEvidence) -> str:
+        return f"{evidence.file_name}:{evidence.start_line}-{evidence.end_line}"
 
     def _emit(self, handler: AgentEventHandler | None, **payload: object) -> None:
-        """把执行事件推给 UI。"""
-
         if handler is not None:
             handler(payload)
 
 
 class PlanAndExecuteRePlanner:
-    """我根据 Observation 决定继续还是收束。"""
+    """根据 Observation 决定是否继续执行剩余步骤。"""
 
     def __init__(self, llm_client: LLMClient) -> None:
         self._llm_client = llm_client
@@ -565,41 +432,31 @@ class PlanAndExecuteRePlanner:
         plan: ExecutionPlan,
         trace: StepExecutionTrace,
     ) -> ExecutionPlan:
-        """更新剩余计划。"""
-
         remaining_steps = plan.steps[1:]
         payload = self._llm_client.generate_json(
             system_prompt="\n".join(
                 [
                     self._llm_client.get_react_agent_role_prompt(),
                     "你当前扮演 RePlanner。",
-                    "请根据刚完成步骤的 Observation 判断要不要继续执行剩余计划。",
+                    "请根据刚完成步骤的 Observation 判断是否继续执行剩余计划。",
                     (
                         "只输出 JSON，格式为 "
-                        '{"is_finished": true/false, "final_summary": "...", '
+                        '{"is_finished": true/false, '
+                        '"final_summary": "...", '
                         '"remaining_steps": [...]}。'
                     ),
                 ]
             ),
-            user_prompt=f"""
-【原计划】
-{chr(10).join(step.display_text for step in plan.steps)}
-
-【刚完成步骤】
-{trace.step.display_text}
-
-【Thought】
-{trace.thought}
-
-【Action】
-{trace.action}
-
-【Observation】
-{trace.observation}
-
-【剩余步骤】
-{chr(10).join(step.display_text for step in remaining_steps) or "无"}
-""".strip(),
+            user_prompt=(
+                f"【原计划】\n"
+                f"{chr(10).join(step.display_text for step in plan.steps)}\n\n"
+                f"【刚完成步骤】{trace.step.display_text}\n"
+                f"【Thought】{trace.thought}\n"
+                f"【Action】{trace.action}\n"
+                f"【Observation】{trace.observation}\n\n"
+                f"【剩余步骤】\n"
+                f"{chr(10).join(step.display_text for step in remaining_steps) or '无'}"
+            ),
             temperature=0.1,
             max_tokens=700,
         )
@@ -611,50 +468,29 @@ class PlanAndExecuteRePlanner:
                 final_summary="",
             )
 
-        updated_steps = self._normalize_steps(payload.get("remaining_steps"))
-        if not updated_steps:
-            updated_steps = remaining_steps
         return ExecutionPlan(
-            steps=updated_steps,
+            steps=remaining_steps,
             rationale=plan.rationale,
-            is_finished=bool(payload.get("is_finished", False)) or not updated_steps,
+            is_finished=bool(payload.get("is_finished", False)) or not remaining_steps,
             final_summary=str(payload.get("final_summary", "")).strip(),
         )
 
-    def _normalize_steps(self, raw_steps: object) -> tuple[PlanStep, ...]:
-        """把再规划后的步骤收敛成稳定结构。"""
-
-        if not isinstance(raw_steps, list):
-            return ()
-
-        normalized_steps: list[PlanStep] = []
-        for index, raw_step in enumerate(raw_steps, start=1):
-            if isinstance(raw_step, dict):
-                description = str(raw_step.get("description", "")).strip()
-                objective = str(raw_step.get("objective", "")).strip()
-            else:
-                description = str(raw_step).strip()
-                objective = ""
-            if not description:
-                continue
-            normalized_steps.append(
-                PlanStep(
-                    step_id=str(index),
-                    description=description,
-                    objective=objective,
-                )
-            )
-        return tuple(normalized_steps)
-
 
 class PlanAndExecuteAgent:
-    """真正按需触发的 Planner / Executor / RePlanner Agent。"""
+    """按需触发的 Planner / Executor / RePlanner 控制中心。"""
 
-    def __init__(self, llm_client=None, evidence_builder: EvidenceBuilder | None = None) -> None:
+    def __init__(
+        self,
+        llm_client=None,
+        evidence_builder: EvidenceBuilder | None = None,
+    ) -> None:
         self._llm_client = llm_client or LLMClient()
         self._evidence_builder = evidence_builder or EvidenceBuilder()
         self.planner = PlanAndExecutePlanner(self._llm_client)
-        self.executor = PlanAndExecuteExecutor(self._llm_client, self._evidence_builder)
+        self.executor = PlanAndExecuteExecutor(
+            self._llm_client,
+            self._evidence_builder,
+        )
         self.replanner = PlanAndExecuteRePlanner(self._llm_client)
 
     def run(
@@ -665,16 +501,17 @@ class PlanAndExecuteAgent:
         project_structure: str,
         event_handler: AgentEventHandler | None = None,
     ) -> AlignmentResult | None:
-        """只有点击特定 Section 后才启动 Agent。"""
-
         if not code_evidences:
-            return None
+            return self._build_academic_only_result(paper_section)
 
         current_candidates = self._evidence_builder.build_alignment_candidates_from_inputs(
             paper_sections=(paper_section,),
             code_evidences=code_evidences,
-            top_k=1,
+            top_k=4,
         )
+        if not current_candidates:
+            return self._build_academic_only_result(paper_section)
+
         plan = self.planner.create_plan(
             paper_section,
             project_structure=project_structure,
@@ -683,6 +520,7 @@ class PlanAndExecuteAgent:
 
         step_traces: list[StepExecutionTrace] = []
         current_plan = plan
+
         while current_plan.steps and not current_plan.is_finished:
             step = current_plan.steps[0]
             self._emit(
@@ -703,9 +541,6 @@ class PlanAndExecuteAgent:
             current_plan = self.replanner.update_plan(current_plan, trace)
             self._emit_plan(current_plan, event_handler)
 
-        if not current_candidates:
-            return None
-
         result = self._build_final_answer(
             paper_section=paper_section,
             current_candidates=current_candidates,
@@ -722,46 +557,44 @@ class PlanAndExecuteAgent:
         step_traces: tuple[StepExecutionTrace, ...],
         current_plan: ExecutionPlan,
     ) -> AlignmentResult:
-        """把执行结果总结成最终结论。"""
-
         payload = self._llm_client.generate_json(
             system_prompt="\n".join(
                 [
                     self._llm_client.get_react_agent_role_prompt(),
                     "你当前在输出 Final Answer。",
-                    "请根据 Thought / Action / Observation 轨迹，给出最终实现链路分析。",
+                    "不要只谈变量映射，要解释代码如何体现论文算法思想。",
+                    "回答必须包含逻辑对齐和科研补完两部分。",
                     (
-                        "只输出 JSON，格式字段包括：best_candidate_index、alignment_score、"
-                        "match_type、analysis、implementation_chain、semantic_evidence、"
-                        "highlighted_lines、improvement_suggestion。"
+                        "只输出 JSON，字段包括 "
+                        '{"best_candidate_index", "alignment_score", "match_type", '
+                        '"analysis", "implementation_chain", "semantic_evidence", '
+                        '"research_supplement", "highlighted_lines", '
+                        '"improvement_suggestion"}。'
                     ),
                 ]
             ),
             user_prompt=self._build_final_answer_prompt(
-                paper_section=paper_section,
-                current_candidates=current_candidates,
-                step_traces=step_traces,
+                paper_section,
+                current_candidates,
+                step_traces,
             ),
             temperature=0.1,
             max_tokens=1800,
         )
         if not isinstance(payload, dict):
-            payload = {
-                "best_candidate_index": 0,
-                "alignment_score": 0.45,
-                "match_type": "partial_match",
-                "analysis": "当前模型没有稳定返回结构化结论，建议人工核对。",
-                "implementation_chain": "当前实现链路尚未稳定收敛。",
-                "semantic_evidence": "只拿到了局部代码证据，缺少完整结构化回答。",
-                "highlighted_lines": [],
-                "improvement_suggestion": "建议重新触发一次分析，或人工阅读候选代码段。",
-            }
+            return self._build_local_fallback_result(
+                paper_section,
+                current_candidates,
+                step_traces,
+                current_plan,
+            )
 
         try:
             selected_index = int(payload.get("best_candidate_index", 0))
         except (TypeError, ValueError):
             selected_index = 0
         selected_index = max(0, min(selected_index, len(current_candidates) - 1))
+
         result = AlignmentResult.from_payload(payload, current_candidates[selected_index])
         plan_steps = current_plan.steps or tuple(trace.step for trace in step_traces)
         return replace(
@@ -770,52 +603,53 @@ class PlanAndExecuteAgent:
             plan_steps=plan_steps,
             step_traces=step_traces,
             agent_observations=tuple(trace.observation for trace in step_traces),
+            research_supplement=(
+                result.research_supplement
+                or self._build_research_supplement(
+                    paper_section,
+                    current_candidates[selected_index].code_evidence,
+                    True,
+                )
+            ),
         )
 
     def _build_final_answer_prompt(
         self,
-        *,
         paper_section: PaperSection,
         current_candidates: tuple[AlignmentCandidate, ...],
         step_traces: tuple[StepExecutionTrace, ...],
     ) -> str:
-        """给 Final Answer 阶段执行轨迹和候选代码。"""
-
-        trace_lines = []
-        for trace in step_traces:
-            trace_lines.extend(
+        traces = (
+            "\n".join(
                 [
-                    f"[Current Plan] {trace.step.display_text}",
-                    f"[Thought] {trace.thought}",
-                    f"[Action] {trace.action}",
-                    f"[Observation] {trace.observation}",
+                    (
+                        f"[Current Plan] {trace.step.display_text}\n"
+                        f"[Thought] {trace.thought}\n"
+                        f"[Action] {trace.action}\n"
+                        f"[Observation] {trace.observation}"
+                    )
+                    for trace in step_traces
                 ]
             )
-
-        candidate_blocks = []
-        for index, candidate in enumerate(current_candidates):
-            candidate_blocks.append(
-                f"""
-[候选 {index}]
-文件: {candidate.code_evidence.file_name}
-范围: L{candidate.code_evidence.start_line}-L{candidate.code_evidence.end_line}
-召回分: {candidate.retrieval_score}
-代码:
-{candidate.code_evidence.code_snippet}
-                """.strip()
-            )
-
-        return f"""
-【论文片段标题】{paper_section.title}
-【论文片段内容】
-{paper_section.content}
-
-【执行轨迹】
-{chr(10).join(trace_lines) or "无"}
-
-【候选代码】
-{chr(10).join(candidate_blocks)}
-""".strip()
+            or "无"
+        )
+        candidates = "\n".join(
+            [
+                (
+                    f"[候选 {index}]\n"
+                    f"文件: {candidate.code_evidence.file_name}\n"
+                    f"范围: L{candidate.code_evidence.start_line}"
+                    f"-L{candidate.code_evidence.end_line}\n"
+                    f"代码:\n{candidate.code_evidence.code_snippet}"
+                )
+                for index, candidate in enumerate(current_candidates)
+            ]
+        )
+        return (
+            f"【论文片段】{paper_section.combined_text}\n\n"
+            f"【执行轨迹】\n{traces}\n\n"
+            f"【候选代码】\n{candidates}"
+        )
 
     def _reflect(
         self,
@@ -823,35 +657,26 @@ class PlanAndExecuteAgent:
         *,
         paper_section: PaperSection,
     ) -> AlignmentResult:
-        """在输出前做自我审计。"""
-
         payload = self._llm_client.generate_json(
             system_prompt="\n".join(
                 [
                     self._llm_client.get_react_agent_role_prompt(),
                     "你当前在做 Reflection。",
-                    "请审计最终结论是否过度自信，若置信度低于 0.8 必须建议人工核对。",
+                    "请审计最终结论是否过度自信。",
+                    "如果置信度低于 0.8，必须建议人工核对。",
                     (
-                        '只输出 JSON，格式为 {"reflection": "...", '
-                        '"final_confidence": 0.0, "confidence_note": "...", '
-                        '"needs_manual_review": true/false}。'
+                        "只输出 JSON，格式为 "
+                        '{"reflection": "...", "final_confidence": 0.0, '
+                        '"confidence_note": "...", "needs_manual_review": true/false}。'
                     ),
                 ]
             ),
-            user_prompt=f"""
-【论文片段标题】{paper_section.title}
-【论文片段内容】
-{paper_section.content}
-
-【当前结论】
-{result.analysis}
-
-【实现链路】
-{result.implementation_chain}
-
-【语义证据】
-{result.semantic_evidence}
-""".strip(),
+            user_prompt=(
+                f"【论文片段】{paper_section.combined_text}\n\n"
+                f"【当前结论】{result.analysis}\n\n"
+                f"【实现链路】{result.implementation_chain}\n\n"
+                f"【科研补完】{result.research_supplement}"
+            ),
             temperature=0.0,
             max_tokens=900,
         )
@@ -859,7 +684,7 @@ class PlanAndExecuteAgent:
             payload = {
                 "reflection": "当前没有稳定拿到反思结果，建议人工核对。",
                 "final_confidence": result.alignment_score,
-                "confidence_note": "模型反思阶段未稳定返回，建议人工核对。",
+                "confidence_note": "模型反思阶段未稳定返回，建议人工复核。",
                 "needs_manual_review": True,
             }
 
@@ -871,17 +696,127 @@ class PlanAndExecuteAgent:
 
         confidence_note = str(payload.get("confidence_note", "")).strip()
         needs_manual_review = bool(payload.get("needs_manual_review", False))
-        if reflected_score < 0.8:
-            needs_manual_review = True
-            if not confidence_note:
-                confidence_note = "我找到了相关代码，但在变量映射上存在歧义，建议人工核对。"
+        if reflected_score < 0.8 and not confidence_note:
+            confidence_note = "当前证据链还不够扎实，建议你人工复核关键实现行。"
 
         return replace(
             result,
             alignment_score=reflected_score,
             reflection=str(payload.get("reflection", "当前缺少自我审计结论。")).strip(),
             confidence_note=confidence_note,
-            needs_manual_review=needs_manual_review,
+            needs_manual_review=needs_manual_review or reflected_score < 0.8,
+        )
+
+    def _build_local_fallback_result(
+        self,
+        paper_section: PaperSection,
+        current_candidates: tuple[AlignmentCandidate, ...],
+        step_traces: tuple[StepExecutionTrace, ...],
+        current_plan: ExecutionPlan,
+    ) -> AlignmentResult:
+        candidate = current_candidates[0]
+        evidence = candidate.code_evidence
+        plan_steps = current_plan.steps or tuple(trace.step for trace in step_traces)
+        symbol_preview = ", ".join(evidence.symbols[:5]) or "与该机制相关的核心调用"
+        analysis = (
+            f"{evidence.file_name} 的 "
+            f"L{evidence.start_line}-L{evidence.end_line} "
+            "是当前最接近论文机制的实现入口。"
+        )
+        return AlignmentResult(
+            paper_section_title=paper_section.title,
+            code_file_name=evidence.file_name,
+            alignment_score=0.45,
+            match_type="partial_match",
+            analysis=analysis,
+            improvement_suggestion="建议沿当前文件继续上追定义与配置来源，确认完整实现链。",
+            retrieval_score=candidate.retrieval_score,
+            semantic_evidence=(
+                f"我优先命中了 {evidence.file_name}，因为它覆盖了符号 {symbol_preview}。"
+            ),
+            research_supplement=self._build_research_supplement(
+                paper_section,
+                evidence,
+                True,
+            ),
+            highlighted_line_numbers=(
+                (evidence.start_line,) if evidence.start_line <= evidence.end_line else ()
+            ),
+            code_snippet=evidence.code_snippet,
+            code_language=evidence.language,
+            code_start_line=evidence.start_line,
+            code_end_line=evidence.end_line,
+            retrieval_plan="\n".join(step.display_text for step in plan_steps),
+            implementation_chain=(
+                "我目前只能确认这段代码承担了与论文机制最相关的模块职责，"
+                "完整算法链路仍建议结合上下文继续追踪。"
+            ),
+            reflection=(
+                "这一轮没有拿到稳定的模型总结，我保留了最接近的代码证据，并建议你人工复核。"
+            ),
+            confidence_note="模型本轮响应不稳定，我先给你一个本地兜底结论。",
+            agent_observations=tuple(trace.observation for trace in step_traces),
+            needs_manual_review=True,
+            plan_steps=plan_steps,
+            step_traces=step_traces,
+        )
+
+    def _build_academic_only_result(self, paper_section: PaperSection) -> AlignmentResult:
+        return AlignmentResult(
+            paper_section_title=paper_section.title,
+            code_file_name="未定位到本地实现",
+            alignment_score=0.35,
+            match_type="missing_implementation",
+            analysis=(
+                "当前没有在本地代码库中定位到能直接承接该论文片段的源码，因此我先切到学术解释模式。"
+            ),
+            improvement_suggestion=(
+                "建议优先检查第三方依赖、配置驱动模块，或沿训练入口继续追踪调用链。"
+            ),
+            retrieval_score=0.0,
+            semantic_evidence="本地未找到稳定候选代码，因此暂无可核验的实现证据。",
+            research_supplement=self._build_research_supplement(
+                paper_section,
+                None,
+                False,
+            ),
+            highlighted_line_numbers=(),
+            code_snippet="# 当前未定位到对应源码\n",
+            code_start_line=1,
+            code_end_line=1,
+            retrieval_plan="未发现可直接承接该论文片段的本地源码，已切换到学术解释模式。",
+            implementation_chain="当前缺少本地代码证据，因此暂时无法构造可靠的实现链路。",
+            reflection="在缺少代码证据时，我优先保证论文解释的完整性，而不是给出伪精确结论。",
+            confidence_note="未命中本地源码，我已切换为论文阅读助手模式。",
+            needs_manual_review=True,
+        )
+
+    def _build_research_supplement(
+        self,
+        paper_section: PaperSection,
+        evidence: CodeEvidence | None,
+        has_code: bool,
+    ) -> str:
+        summary = paper_section.content.replace("\n", " ").strip()
+        if len(summary) > 140:
+            summary = summary[:140] + "..."
+
+        if has_code and evidence is not None:
+            return (
+                f"从论文语义看，这一段主要在说明“{paper_section.title}”对应的算法机制。"
+                f"当前命中的 {evidence.file_name} 更像该机制的实现入口，"
+                "建议把它和上游模块、配置项一起看。"
+                "如果后续追踪仍缺失关键步骤，常见原因是："
+                "核心逻辑被拆进基类、由配置开关动态注入，"
+                "或者部分能力通过第三方库封装。"
+            )
+
+        return (
+            f"学术解释模式：这段论文主要在讲“{paper_section.title}”。"
+            f"就当前文字来看，它想强调的是：{summary}"
+            "如果代码库里暂时找不到直接实现，常见原因包括："
+            "该能力被第三方库封装、被基础类或公共模块间接实现，"
+            "或者当前仓库并没有包含完整训练 / 推理链路。"
         )
 
     def _emit_plan(
@@ -889,8 +824,6 @@ class PlanAndExecuteAgent:
         plan: ExecutionPlan,
         handler: AgentEventHandler | None,
     ) -> None:
-        """把当前计划推给 UI。"""
-
         if handler is None:
             return
         handler(
@@ -903,7 +836,5 @@ class PlanAndExecuteAgent:
         )
 
     def _emit(self, handler: AgentEventHandler | None, **payload: object) -> None:
-        """统一派发事件。"""
-
         if handler is not None:
             handler(payload)

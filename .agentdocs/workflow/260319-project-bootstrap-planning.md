@@ -437,6 +437,46 @@ labflow-ai/
   - `.\.tools\ruff\ruff.exe format --check app.py src tests`
   - `python -m pytest`
 
+## 当前稳定性修复
+
+- 已收口 LLM 请求失败路径：
+  - `LLMClient.generate_json()` 在 `429 rate limit` 场景下会短退避重试
+  - 若仍失败，则统一回退为 `None`，由上层 Agent 走本地兜底逻辑
+  - 不再把 OpenAI SDK 异常直接抛到 Streamlit 页面顶层
+- 已增强脏 JSON 兼容：
+  - 会自动剥离代码块包裹
+  - 会清洗非法控制字符
+  - 会尝试从混杂文本里裁出最外层 JSON 对象
+  - 若仍无法解析，则回退为 `None`
+- 已补充回归测试：
+  - `test_llm_client.py` 覆盖代码块 JSON、控制字符清洗和无效 JSON 回退
+  - `test_aligner.py` 覆盖模型完全不可用时的 Agent 降级
+- 已完成本轮本地校验：
+  - `.\.tools\ruff\ruff.exe check app.py src tests`
+  - `.\.tools\ruff\ruff.exe format --check app.py src tests`
+  - `python -m pytest`
+  - `streamlit` 本地冒烟探活返回 `200`
+
+## 当前导师式交互整改
+
+- 已将 Agent 的角色定位从“编译器式变量核对”调整为“导师式科研解释”：
+  - System Prompt 明确要求优先解释算法思想、理论动机与工程落点
+  - 当本地未命中可靠代码时，必须自动切换为“学术解释模式”
+  - Final Answer 必须覆盖“逻辑对齐”和“科研补完”两部分
+- 已将工作区右栏改为“结果优先、链路折叠”的展示模式：
+  - 推理过程中通过 `st.status` 实时展示 `Current Plan / Thought / Action / Observation`
+  - 推理完成后默认仅保留最终结论、科研补完、自我审计与代码高亮
+  - 中间推理过程统一收进“查看推理链路”折叠面板，降低 UI 噪音
+- 已强化按需 ReAct 的优雅降级：
+  - 模型未稳定返回结构化动作时，Executor 会结束当前步骤并沿已有证据继续推进
+  - 模型未稳定返回 Final Answer 时，Agent 会给出本地兜底的实现入口判断
+  - 若没有代码证据，则返回论文阅读助手式解释，而不是直接断流
+- 已补齐本轮本地校验：
+  - `.\.tools\ruff\ruff.exe check app.py src tests`
+  - `.\.tools\ruff\ruff.exe format --check app.py src tests`
+  - `python -m pytest`
+  - `streamlit` 本地冒烟探活返回 `200`
+
 ## TODO
 
 - [x] 读取根目录全部文件

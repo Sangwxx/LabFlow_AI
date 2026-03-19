@@ -126,6 +126,16 @@ class FakeLowConfidenceLLMClient(FakePlanAndExecuteLLMClient):
         return super().generate_json(system_prompt=system_prompt, user_prompt=user_prompt, **kwargs)
 
 
+class FakeUnavailableLLMClient:
+    """我模拟整轮模型不可用，验证 Agent 也要优雅降级。"""
+
+    def get_react_agent_role_prompt(self) -> str:
+        return "你是一个源码审计专家。"
+
+    def generate_json(self, **_: object) -> None:
+        return None
+
+
 def test_plan_and_execute_agent_builds_plan_and_traces() -> None:
     """Agent 应先规划，再按需执行，并保留执行轨迹。"""
 
@@ -255,6 +265,42 @@ def test_executor_tools_cover_project_structure_and_code_reading() -> None:
     assert "def build_attention" in snippet
     assert candidates
     assert "models/attention.py" in search_result
+
+
+def test_agent_falls_back_when_llm_is_unavailable() -> None:
+    """模型完全不可用时，Agent 也应该给出本地兜底结果，而不是崩溃。"""
+
+    section = PaperSection(
+        title="3.3 Attention",
+        content="The model projects q and applies output projection.",
+        level=2,
+        page_number=3,
+        order=2,
+    )
+    evidences = (
+        CodeEvidence(
+            file_name="models/attention.py",
+            code_snippet="q = self.q_proj(x)\nout = self.out_proj(q)",
+            related_git_diff="",
+            symbols=("q_proj", "out_proj"),
+            commit_context=(),
+            start_line=24,
+            end_line=25,
+        ),
+    )
+
+    result = PlanAndExecuteAgent(
+        llm_client=FakeUnavailableLLMClient(),
+        evidence_builder=EvidenceBuilder(),
+    ).run(
+        section,
+        evidences,
+        project_structure="models / attention.py",
+    )
+
+    assert result is not None
+    assert result.match_type == "partial_match"
+    assert result.needs_manual_review is True
 
 
 def test_aligner_class_keeps_compatibility_entrypoint() -> None:

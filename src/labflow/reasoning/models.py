@@ -74,7 +74,7 @@ class CodeSemanticSummary:
 
     @property
     def search_text(self) -> str:
-        """把语义摘要、职责、符号和原始代码聚合成检索文本。"""
+        """把摘要、职责和原始代码聚合成检索文本。"""
 
         return "\n".join(
             item
@@ -119,7 +119,7 @@ class PlanStep:
 
     @property
     def display_text(self) -> str:
-        """把步骤整理成 UI 可直接展示的文本。"""
+        """整理成 UI 可直接展示的文本。"""
 
         if self.objective:
             return f"{self.step_id}. {self.description} | 目标: {self.objective}"
@@ -169,6 +169,7 @@ class AlignmentResult:
     improvement_suggestion: str
     retrieval_score: float
     semantic_evidence: str = ""
+    research_supplement: str = ""
     highlighted_line_numbers: tuple[int, ...] = ()
     code_snippet: str = ""
     code_language: str = "python"
@@ -185,13 +186,13 @@ class AlignmentResult:
 
     @property
     def score_out_of_ten(self) -> float:
-        """把 0-1 分值映射为 10 分制，便于结果呈现。"""
+        """把 0-1 分值映射为 10 分制。"""
 
         return round(self.alignment_score * 10, 1)
 
     @property
     def is_high_risk(self) -> bool:
-        """低分项和明显错配项都应该优先报警。"""
+        """低分项和明显错配项都应优先报警。"""
 
         return self.alignment_score < 0.6 or self.match_type in {
             "missing_implementation",
@@ -200,7 +201,7 @@ class AlignmentResult:
 
     @property
     def is_good_alignment(self) -> bool:
-        """高置信度一致项单独归类，方便做正向展示。"""
+        """高置信度一致项单独归类。"""
 
         return self.alignment_score >= 0.75 and self.match_type == "strong_match"
 
@@ -212,7 +213,7 @@ class AlignmentResult:
             payload.get("alignment_score", payload.get("score", candidate.retrieval_score))
         )
         normalized_score = max(0.0, min(1.0, raw_score))
-        raw_match_type = str(payload.get("match_type", "partial_match"))
+        raw_match_type = str(payload.get("match_type", "partial_match")).strip()
         if raw_match_type not in {
             "strong_match",
             "partial_match",
@@ -220,6 +221,7 @@ class AlignmentResult:
             "formula_mismatch",
         }:
             raw_match_type = "partial_match"
+
         highlighted_lines = cls._normalize_highlighted_lines(payload, candidate)
 
         return cls(
@@ -235,6 +237,7 @@ class AlignmentResult:
             semantic_evidence=str(
                 payload.get("semantic_evidence", payload.get("analysis", "当前缺少语义证据。"))
             ).strip(),
+            research_supplement=str(payload.get("research_supplement", "")).strip(),
             highlighted_line_numbers=highlighted_lines,
             code_snippet=candidate.code_evidence.code_snippet,
             code_language=candidate.code_evidence.language,
@@ -258,9 +261,9 @@ class AlignmentResult:
 
         raw_lines = payload.get("highlighted_lines", [])
         if not isinstance(raw_lines, list):
-            return ()
+            raw_lines = []
 
-        valid_lines: list[int] = []
+        normalized_lines: list[int] = []
         for raw_line in raw_lines:
             try:
                 line_number = int(raw_line)
@@ -271,6 +274,11 @@ class AlignmentResult:
                 <= line_number
                 <= candidate.code_evidence.end_line
             ):
-                if line_number not in valid_lines:
-                    valid_lines.append(line_number)
-        return tuple(valid_lines)
+                normalized_lines.append(line_number)
+
+        if normalized_lines:
+            return tuple(dict.fromkeys(normalized_lines))
+
+        if candidate.code_evidence.start_line <= candidate.code_evidence.end_line:
+            return (candidate.code_evidence.start_line,)
+        return ()
