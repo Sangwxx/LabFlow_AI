@@ -7,6 +7,12 @@ from importlib import import_module
 
 from labflow.config.settings import get_settings
 
+REACT_AGENT_ROLE_PROMPT = (
+    "你是一个精通 PyTorch 和 Vision-Language Navigation 的源码审计专家。"
+    "你的任务是根据用户选中的论文片段，利用 list_files 和 read_code 工具在代码库中寻找实现证据。"
+    "你必须通过 Thought 表达你的推理，通过 Action 调用工具，最后给出 Final Answer。"
+)
+
 
 class LLMClient:
     """我把模型调用细节收口在这里，避免推理层直接碰底层 SDK。"""
@@ -52,6 +58,11 @@ class LLMClient:
         )
         content = response.choices[0].message.content or "{}"
         return self._loads_json(content)
+
+    def get_react_agent_role_prompt(self) -> str:
+        """给 Agent 家族共享同一份角色设定。"""
+
+        return REACT_AGENT_ROLE_PROMPT
 
     def _loads_json(self, content: str) -> dict:
         """把模型返回内容解析成 JSON 对象。"""

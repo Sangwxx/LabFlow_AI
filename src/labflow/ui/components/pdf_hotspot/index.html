@@ -1,0 +1,184 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8" />
+    <title>LabFlow PDF Hotspot</title>
+    <style>
+        html, body {
+            margin: 0;
+            padding: 0;
+            background: transparent;
+            overflow: hidden;
+            font-family: "IBM Plex Sans SC", "Microsoft YaHei", sans-serif;
+        }
+
+        #root {
+            width: 100%;
+        }
+
+        .pdf-scroll {
+            overflow-y: auto;
+            padding-right: 4px;
+            background: rgba(255, 255, 255, 0.72);
+            border-radius: 16px;
+            box-sizing: border-box;
+        }
+
+        .pdf-page {
+            margin-bottom: 14px;
+        }
+
+        .pdf-page-inner {
+            position: relative;
+            width: 100%;
+        }
+
+        .pdf-page-image {
+            width: 100%;
+            display: block;
+            border-radius: 10px;
+            box-shadow: 0 10px 24px rgba(15, 23, 42, 0.08);
+        }
+
+        .pdf-hotspot {
+            position: absolute;
+            border-radius: 4px;
+            box-sizing: border-box;
+            cursor: pointer;
+            transition: background 120ms ease, border-color 120ms ease;
+        }
+
+        .pdf-hotspot:hover {
+            background: rgba(59, 130, 246, 0.18) !important;
+            border-color: rgba(37, 99, 235, 0.96) !important;
+        }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+    <script>
+        const ComponentMessageType = {
+            COMPONENT_READY: "streamlit:componentReady",
+            SET_COMPONENT_VALUE: "streamlit:setComponentValue",
+            SET_FRAME_HEIGHT: "streamlit:setFrameHeight",
+        };
+
+        const StreamlitMessageType = {
+            RENDER: "streamlit:render",
+        };
+
+        function sendMessage(type, payload = {}) {
+            window.parent.postMessage(
+                {
+                    isStreamlitMessage: true,
+                    type,
+                    ...payload,
+                },
+                "*"
+            );
+        }
+
+        function setFrameHeight(height) {
+            sendMessage(ComponentMessageType.SET_FRAME_HEIGHT, { height });
+        }
+
+        function setComponentValue(value) {
+            sendMessage(ComponentMessageType.SET_COMPONENT_VALUE, {
+                value,
+                dataType: "json",
+            });
+        }
+
+        function render(payload) {
+            const root = document.getElementById("root");
+            const args = payload.args || {};
+            const pages = Array.isArray(args.pages) ? args.pages : [];
+            const hotspots = Array.isArray(args.hotspots) ? args.hotspots : [];
+            const height = Number(args.height || 920);
+            const targetPage = Number(args.target_page || 1);
+            const selectedBlockOrder = args.selected_block_order;
+
+            const pageMarkup = pages
+                .map((page, pageIndex) => {
+                    const currentPageNumber = pageIndex + 1;
+                    const pageHotspots = hotspots.filter(
+                        hotspot => hotspot.page_number === currentPageNumber
+                    );
+
+                    const hotspotMarkup = pageHotspots
+                        .map(hotspot => {
+                            const isSelected = hotspot.block_order === selectedBlockOrder;
+                            const borderColor = isSelected
+                                ? "rgba(37, 99, 235, 0.96)"
+                                : "rgba(37, 99, 235, 0.28)";
+                            const background = isSelected
+                                ? "rgba(59, 130, 246, 0.14)"
+                                : "rgba(59, 130, 246, 0.04)";
+                            return `
+                                <button
+                                    class="pdf-hotspot"
+                                    type="button"
+                                    data-block-order="${hotspot.block_order}"
+                                    title="${hotspot.label || ""}"
+                                    style="
+                                        top: ${hotspot.top_percent}%;
+                                        left: ${hotspot.left_percent}%;
+                                        width: ${hotspot.width_percent}%;
+                                        height: ${hotspot.height_percent}%;
+                                        border: 1px solid ${borderColor};
+                                        background: ${background};
+                                    "
+                                ></button>
+                            `;
+                        })
+                        .join("");
+
+                    return `
+                        <div id="labflow-page-${currentPageNumber}" class="pdf-page">
+                            <div class="pdf-page-inner">
+                                <img
+                                    class="pdf-page-image"
+                                    src="data:image/png;base64,${page}"
+                                    alt="PDF page ${currentPageNumber}"
+                                />
+                                ${hotspotMarkup}
+                            </div>
+                        </div>
+                    `;
+                })
+                .join("");
+
+            root.innerHTML = `
+                <div id="pdf-scroll" class="pdf-scroll" style="height: ${height}px;">
+                    ${pageMarkup}
+                </div>
+            `;
+
+            const shell = document.getElementById("pdf-scroll");
+            const target = document.getElementById(`labflow-page-${targetPage}`);
+            if (shell && target) {
+                target.scrollIntoView({ block: "start", behavior: "instant" });
+            }
+
+            document.querySelectorAll(".pdf-hotspot").forEach(element => {
+                element.addEventListener("click", event => {
+                    const blockOrder = Number(event.currentTarget.dataset.blockOrder);
+                    setComponentValue(blockOrder);
+                });
+            });
+
+            setFrameHeight(height + 8);
+        }
+
+        window.addEventListener("message", event => {
+            if (!event.data || event.data.type !== StreamlitMessageType.RENDER) {
+                return;
+            }
+            render(event.data);
+        });
+
+        sendMessage(ComponentMessageType.COMPONENT_READY, { apiVersion: 1 });
+        setFrameHeight(960);
+    </script>
+</body>
+</html>

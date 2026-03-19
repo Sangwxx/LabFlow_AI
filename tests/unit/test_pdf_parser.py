@@ -1,5 +1,6 @@
 """PDF 解析器测试。"""
 
+from io import BytesIO
 from types import SimpleNamespace
 
 import pytest
@@ -10,8 +11,9 @@ from labflow.parsers.pdf_parser import PDFParser
 class FakePage:
     """伪造的 PDF 页面。"""
 
-    def __init__(self, blocks: list[dict]) -> None:
+    def __init__(self, blocks: list[dict], *, width: float = 595.0, height: float = 842.0) -> None:
         self._blocks = blocks
+        self.rect = SimpleNamespace(width=width, height=height)
 
     def get_text(self, mode: str) -> dict:
         """返回伪造的 PyMuPDF `dict` 结构。"""
@@ -40,10 +42,16 @@ class FakeDocument:
         return None
 
 
-def build_text_block(text: str, font_size: float) -> dict:
+def build_text_block(
+    text: str,
+    font_size: float,
+    *,
+    bbox: tuple[float, float, float, float] = (10.0, 20.0, 200.0, 60.0),
+) -> dict:
     """构造一段简化的文本块。"""
 
     return {
+        "bbox": bbox,
         "lines": [
             {
                 "spans": [
@@ -53,7 +61,7 @@ def build_text_block(text: str, font_size: float) -> dict:
                     }
                 ]
             }
-        ]
+        ],
     }
 
 
@@ -83,6 +91,8 @@ def test_pdf_parser_classifies_title_and_paragraph(monkeypatch) -> None:
     assert result.page_count == 1
     assert len(result.title_blocks) == 1
     assert result.title_blocks[0].text == "1 Introduction"
+    assert result.title_blocks[0].bbox == (10.0, 20.0, 200.0, 60.0)
+    assert result.title_blocks[0].page_width == 595.0
     assert len(result.paragraph_blocks) == 1
 
 
@@ -97,6 +107,29 @@ def test_pdf_parser_rejects_encrypted_document(monkeypatch) -> None:
 
     with pytest.raises(ValueError, match="已加密"):
         parser.parse_bytes(b"demo-pdf", source_name="locked.pdf")
+
+
+def test_pdf_parser_supports_bytesio_stream(monkeypatch) -> None:
+    """上传组件给我的是内存流时，我也要能正常读取。"""
+
+    fake_document = FakeDocument(
+        pages=[
+            FakePage(
+                [
+                    build_text_block("2 Method", 17),
+                    build_text_block("The method uses a streamed PDF input.", 11),
+                ]
+            )
+        ]
+    )
+    fake_fitz = SimpleNamespace(open=lambda **_: fake_document)
+    monkeypatch.setattr("labflow.parsers.pdf_parser._load_fitz_module", lambda: fake_fitz)
+
+    parser = PDFParser()
+    result = parser.parse_stream(BytesIO(b"demo-pdf"), source_name="stream.pdf")
+
+    assert result.source_name == "stream.pdf"
+    assert result.title_blocks[0].text == "2 Method"
 
 
 def test_pdf_parser_requires_existing_file() -> None:

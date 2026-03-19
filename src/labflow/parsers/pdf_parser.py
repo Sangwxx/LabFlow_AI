@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from importlib import import_module
+from io import BytesIO
 from pathlib import Path
 from statistics import mean
+from typing import BinaryIO
+
+PDF_BBOX = tuple[float, float, float, float]
 
 
 def _load_fitz_module():
@@ -26,6 +31,9 @@ class PDFBlock:
     page_number: int
     order: int
     font_size: float
+    bbox: PDF_BBOX = (0.0, 0.0, 0.0, 0.0)
+    page_width: float = 1.0
+    page_height: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -92,6 +100,16 @@ class PDFParser:
         except Exception as exc:
             self._raise_pdf_error(exc)
 
+    def parse_stream(
+        self,
+        pdf_stream: bytes | bytearray | BinaryIO | BytesIO | object,
+        source_name: str = "uploaded.pdf",
+    ) -> PDFParseResult:
+        """兼容上传组件返回的内存流对象。"""
+
+        pdf_bytes = self._coerce_stream_to_bytes(pdf_stream)
+        return self.parse_bytes(pdf_bytes=pdf_bytes, source_name=source_name)
+
     def _parse_document(self, document, source_name: str) -> PDFParseResult:
         """从已打开的文档中抽取结构化内容。"""
 
@@ -101,17 +119,23 @@ class PDFParser:
         raw_blocks: list[dict[str, object]] = []
         for page_index, page in enumerate(document, start=1):
             page_dict = page.get_text("dict")
+            page_width = float(page.rect.width or 1.0)
+            page_height = float(page.rect.height or 1.0)
             for block in page_dict.get("blocks", []):
                 text = self._extract_block_text(block)
                 if not text:
                     continue
 
                 font_size = self._extract_font_size(block)
+                bbox = self._extract_block_bbox(block)
                 raw_blocks.append(
                     {
                         "text": text,
                         "page_number": page_index,
                         "font_size": font_size,
+                        "bbox": bbox,
+                        "page_width": page_width,
+                        "page_height": page_height,
                     }
                 )
 
@@ -121,6 +145,59 @@ class PDFParser:
             page_count=len(document),
             blocks=tuple(classified_blocks),
         )
+
+    def _coerce_stream_to_bytes(
+        self,
+        pdf_stream: bytes | bytearray | BinaryIO | BytesIO | object,
+    ) -> bytes:
+        """把各种上传流统一压成字节，避免 Streamlit 上传对象和普通 BytesIO 走不同分支。"""
+
+        if isinstance(pdf_stream, bytes):
+            return pdf_stream
+        if isinstance(pdf_stream, bytearray):
+            return bytes(pdf_stream)
+
+        stream_reader = self._resolve_reader(pdf_stream)
+        if stream_reader is None:
+            raise ValueError("无法识别 PDF 输入流，需提供文件路径、字节流或类文件对象。")
+
+        pdf_bytes = stream_reader()
+        if isinstance(pdf_bytes, bytearray):
+            pdf_bytes = bytes(pdf_bytes)
+        if not isinstance(pdf_bytes, bytes):
+            raise ValueError("PDF 输入流读取失败，返回结果不是字节内容。")
+        if not pdf_bytes:
+            raise ValueError("PDF 文件内容为空。")
+        return pdf_bytes
+
+    def _resolve_reader(
+        self,
+        pdf_stream: BinaryIO | BytesIO | object,
+    ) -> Callable[[], bytes | bytearray | object] | None:
+        """优先兼容 UploadedFile.getvalue()，其次兼容标准类文件对象。"""
+
+        getvalue = getattr(pdf_stream, "getvalue", None)
+        if callable(getvalue):
+            return getvalue
+
+        read = getattr(pdf_stream, "read", None)
+        if callable(read):
+            try:
+                current_position = pdf_stream.tell()
+            except (AttributeError, OSError):
+                current_position = None
+
+            def read_all() -> bytes | bytearray | object:
+                if current_position is not None:
+                    try:
+                        pdf_stream.seek(0)
+                    except (AttributeError, OSError):
+                        pass
+                return read()
+
+            return read_all
+
+        return None
 
     def _classify_blocks(self, raw_blocks: list[dict[str, object]]) -> list[PDFBlock]:
         """用启发式规则把文本块区分为标题和正文。"""
@@ -149,6 +226,9 @@ class PDFParser:
                     page_number=int(block["page_number"]),
                     order=index,
                     font_size=font_size,
+                    bbox=tuple(float(value) for value in block.get("bbox", (0.0, 0.0, 0.0, 0.0))),
+                    page_width=float(block.get("page_width", 1.0)),
+                    page_height=float(block.get("page_height", 1.0)),
                 )
             )
 
@@ -223,6 +303,14 @@ class PDFParser:
                 if isinstance(size, (int, float)):
                     sizes.append(float(size))
         return mean(sizes) if sizes else 0.0
+
+    def _extract_block_bbox(self, block: dict) -> PDF_BBOX:
+        """提取文本块边界框，给页图热区叠加打底。"""
+
+        bbox = block.get("bbox", (0.0, 0.0, 0.0, 0.0))
+        if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+            return (0.0, 0.0, 0.0, 0.0)
+        return tuple(float(value) for value in bbox)
 
     def _raise_pdf_error(self, exc: Exception) -> None:
         """统一转换常见 PDF 解析异常。"""

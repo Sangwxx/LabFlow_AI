@@ -3,7 +3,6 @@
 from pathlib import Path
 from uuid import uuid4
 
-import pytest
 from git import InvalidGitRepositoryError, Repo
 
 from labflow.parsers.git_repo_parser import GitRepoParser
@@ -48,19 +47,24 @@ def test_git_repo_parser_collects_recent_commits_and_diff() -> None:
     assert result.branch_name
 
 
-def test_git_repo_parser_rejects_non_repo_directory(monkeypatch) -> None:
-    """普通目录不该被我当成仓库。"""
+def test_git_repo_parser_supports_plain_source_directory(monkeypatch) -> None:
+    """即使目录里没有 .git，我也要把它当成待分析源码目录。"""
 
     repo_path = create_repo_path("non-repo")
-    parser = GitRepoParser()
+    (repo_path / "trainer.py").write_text("alpha = 0.30\nbeta = 0.70\n", encoding="utf-8")
 
     class FailingRepo:
-        """我用这个假对象模拟 GitPython 的报错。"""
+        """我用这个假对象强制走普通目录兜底分支。"""
 
         def __new__(cls, *args, **kwargs):
             raise InvalidGitRepositoryError("bad repo")
 
     monkeypatch.setattr("labflow.parsers.git_repo_parser.Repo", FailingRepo)
 
-    with pytest.raises(ValueError, match="不是 Git 仓库"):
-        parser.parse(repo_path)
+    result = GitRepoParser().parse(repo_path)
+
+    assert result.source_type == "directory"
+    assert result.branch_name == "UNVERSIONED"
+    assert result.recent_commits == ()
+    assert "diff --git a/trainer.py b/trainer.py" in result.working_tree_diff
+    assert result.source_files[0].relative_path == "trainer.py"

@@ -246,6 +246,51 @@ labflow-ai/
   - `pytest`
   - `streamlit run app.py --server.headless true`
 
+## 阶段 3 当前进展
+
+- 已实现 `ReportGenerator`，支持：
+  - 汇总项目概况
+  - 输出高风险错配项与一致性良好项
+  - 汇总改进建议
+  - 导出标准 Markdown 审计周报
+- 已增强首页可视化：
+  - 风险预警仪表盘
+  - 总体对齐置信度 `st.metric`
+  - 评分低于 6 分的可疑错配项置顶
+  - Markdown 报告下载按钮
+- 已补充结果缓存逻辑：
+  - 真实输入分析结果优先展示
+  - 无真实结果时回退到内置参数错配案例
+- 已完成阶段 3 当前范围内的本地校验：
+  - `ruff check app.py src tests`
+  - `ruff format --check app.py src tests`
+  - `pytest`
+  - `streamlit run app.py --server.headless true`
+
+## 联调阶段紧急修复
+
+- 已完成 Streamlit 首页重构：
+  - 主界面改为 `数据采集 / 分析报告 / 历史记录` 三标签布局
+  - 所有输入配置统一收纳到侧边栏
+  - 未执行分析前主界面仅保留欢迎语、状态摘要与操作指南
+  - 分析完成后尝试自动切换到“分析报告”标签页
+- 已修复 PDF 上传流兼容性：
+  - `PDFParser` 现支持本地路径、裸 `bytes`、`BytesIO` 和上传组件类文件对象
+  - 缺少 `PyMuPDF` 时不再把页面打崩，而是在 UI 中给出显式安装提示
+- 已增强普通源码目录容错：
+  - `GitRepoParser` 在无 `.git` 时回退为“普通源码目录”模式
+  - 会将目录中的文本源码文件包装为快照式 diff，继续进入 BM25 召回与推理链路
+  - 不再因 GitHub Zip 解压目录直接报错中断
+- 已增强报告页联调可观测性：
+  - 保留风险预警仪表盘
+  - 置顶展示评分低于 6 分的可疑项
+  - 增加 BM25 召回观察面板，便于判断召回章节是否与代码目录相关
+  - 保留 Markdown 报告下载入口
+- 已完成本轮紧急修复的本地校验：
+  - `.\.tools\ruff\ruff.exe check app.py src tests`
+  - `.\.tools\ruff\ruff.exe format --check app.py src tests`
+  - `python -m pytest`
+
 ## 风险与前置问题
 
 ### 已发现风险
@@ -258,6 +303,139 @@ labflow-ai/
 ### 需要用户确认的问题
 
 - 当前已确认，无新增阻塞问题。
+
+## 当前补充约束
+
+- 联调期页面不得在每次重绘时自动触发 PDF/Git 解析，必须改为显式按钮触发，避免主界面被异常提示淹没。
+- 代码目录输入必须兼容“真实 Git 仓库”和“Zip 解压后的普通源码目录”两类场景。
+- PDF 上传必须优先支持 Streamlit 上传组件返回的内存流对象，不能只假设输入是本地路径。
+
+## 当前交互重构
+
+- 已将首页交互从“报告输出优先”切换为“知云式联动阅读优先”：
+  - 主界面采用 `st.columns([2, 1])` 双栏布局
+  - 左栏负责 PDF 预览与章节选择
+  - 右栏负责展示与当前章节最相关的代码片段
+- 已引入浏览器原生 PDF 预览组件封装：
+  - 上传后的 PDF 字节流可直接在页面左侧显示
+  - 不依赖解析成功即可完成文档预览
+  - 若已选中章节，会优先把预览聚焦到对应页码
+- 已将代码侧联动逻辑切换为“局部检索”：
+  - 点击左侧章节目录后，右栏仅针对该章节执行局部召回
+  - 右栏输出真实代码片段、文件路径、行号范围与局部对齐评分
+  - 不再默认执行全量报告分析
+- 已增强代码源降级策略：
+  - 对真实 Git 仓库，会扫描仓库内 `.py` 文件构建代码片段
+  - 对无 `.git` 的目录，会直接扫描 `.py` 文件作为代码源
+  - 代码证据切片按函数/类边界优先拆分，尽量保证右栏阅读连续性
+- 已完成本轮“知云模式”改造的本地校验：
+  - `.\.tools\ruff\ruff.exe check app.py src tests`
+  - `.\.tools\ruff\ruff.exe format --check app.py src tests`
+  - `python -m pytest`
+  - `streamlit run app.py --server.headless true --server.address 127.0.0.1 --server.port 8501`
+
+## 当前路由重构
+
+- 已将主页面进一步拆成“门户入口 -> 阅读工作区”两段式路由：
+  - 首页仅保留欢迎文案、PDF 上传入口、代码路径入口和“进入工作区”按钮
+  - 工作区独占主区域，不再展示路径/API 等配置表单
+  - 配置项统一沉到折叠侧边栏
+- 已将工作区布局进一步收敛为沉浸式阅读视图：
+  - 左栏按 `st.columns([1.5, 1])` 展示章节定位器和全高 PDF 预览
+  - 右栏只保留局部代码片段和对齐结论
+  - 不再展示召回调试面板、仪表盘或中间态摘要
+- 已补充当前界面的纯逻辑测试：
+  - 即时对齐结论评分与文案生成已纳入单元测试
+
+## 当前布局微调
+
+- 已将工作区代码侧继续压缩为“单条结论提示 + 固定高代码块”两层结构，避免右栏被说明文字吞掉。
+- 已通过全局 CSS 收紧主容器边距、列宽约束与代码行高，优先追求更接近 IDE 的占屏效果。
+- 当前工作区列宽继续采用 `st.columns([1.5, 1])`，在保证 PDF 可读性的同时尽量放大代码区的有效宽度。
+
+## 当前语义对齐重构
+
+- 已将推理链从“BM25 主导”切换为“LLM 语义理解主导”：
+  - BM25 仅保留为候选裁剪与首轮召回
+  - `align_section()` 会把论文片段与多段代码候选一起交给模型做语义选择
+  - 模型需要基于算法结构、控制流程、张量流向与模块职责做判断，而不是仅依赖变量名相似度
+- 已扩展结构化对齐结果：
+  - `AlignmentResult` 新增 `semantic_evidence`
+  - `AlignmentResult` 新增 `highlighted_line_numbers`
+  - 右侧代码面板直接消费模型给出的关键逻辑行进行高亮
+- 已将工作区右栏改为“Agent 理解结论 + Agent 理解证据 + 逻辑行高亮代码”的语义阅读模式：
+  - 点击论文片段后，右栏优先展示模型解释为什么这段代码实现了论文机制
+  - 命中的关键实现行会在代码画布中高亮，降低人工二次定位成本
+- 已补齐本轮语义重构的单元测试：
+  - 对齐器测试覆盖 `semantic_evidence` 与 `highlighted_lines`
+  - UI 测试覆盖语义代码高亮 HTML 输出
+
+## 当前 Agent 架构重构
+
+- 已将线性 `aligner.py -> 单次裁决` 改造为 `agent_executor.py -> ReAct 循环`：
+  - 第一步先生成“检索计划”
+  - 若首轮证据不足，自动沿函数名、类名和关键变量继续追踪调用链
+  - 在进入最终结论前，保留每轮“观察”结果，形成实现链路上下文
+- 已为代码侧新增“语义索引”能力：
+  - `EvidenceBuilder` 现在可以对仓库代码片段生成 `CodeSemanticSummary`
+  - 每个索引条目包含逻辑摘要、职责、定义符号、调用符号和锚点词
+  - 首轮召回不再只看原始代码切片，而是优先看语义摘要
+- 已为输出层新增“反思层”：
+  - 最终结果进入 UI 前会再经过一轮自我审计
+  - 若置信度低于 8 分，强制提示“建议人工核对”
+  - 结构化结果已新增检索计划、实现链路分析、自我审计和人工核对标记
+- 已将工作区右栏升级为 Agent 结果面板：
+  - 展示检索计划
+  - 展示实现链路分析
+  - 展示 Agent 理解证据
+  - 展示自我审计与低置信度提醒
+- 已完成本轮 Agent 改造的本地校验：
+  - `.\.tools\ruff\ruff.exe check app.py src tests`
+  - `.\.tools\ruff\ruff.exe format --check app.py src tests`
+  - `python -m pytest`
+
+## 当前 Plan-and-Execute 重构
+
+- 已参考 Planner / Executor / RePlanner 的任务拆解方式，将控制中心正式收敛为 `PlanAndExecuteAgent`
+- 当前执行链路变为：
+  - `Planner.create_plan()` 先根据 `PaperSection` 和项目结构生成多步计划
+  - `Executor.execute()` 针对单个步骤使用工具箱做 ReAct 式执行
+  - `RePlanner.update_plan()` 根据最新 Observation 决定是否继续执行后续步骤
+  - 最终再进入总结器与反思器输出实现链路分析
+- 当前工具箱已具备：
+  - `list_project_structure()`
+  - `read_code_segment(path, line_start, line_end)`
+  - `llm_semantic_search(query)`
+- 当前 UI 已在右侧区域接入执行态可视化：
+  - `st.status` 实时展示 `[Current Plan]`
+  - `st.status` 实时展示 `[Thought]`
+  - `st.status` 实时展示 `[Action]`
+  - 最终通过 `st.expander` 保留完整执行轨迹，便于复盘 Agent 过程
+- 当前结构上，`aligner.py` 已降为兼容层：
+  - 保留既有 `align()` / `align_inputs()` / `align_section()` 入口
+  - 实际执行逻辑统一委托给 `PlanAndExecuteAgent`
+
+## 当前按需 ReAct 重构
+
+- 已停止所有“启动即全量索引”的逻辑：
+  - `app.py` 初始化阶段只准备 PDF 结构和项目文件树
+  - 不再在启动或进入工作区时提前调用任何全量语义索引
+  - 代码证据改为只有点击具体 `PaperSection` 后才懒加载
+- 已将 Agent 执行机制收敛为 `Thought -> Action -> Observation -> Final Answer`：
+  - Planner 先根据论文片段和文件树拆计划
+  - Executor 再按需调用 `list_project_structure / read_code_segment / llm_semantic_search`
+  - RePlanner 根据 Observation 决定是否继续下一轮
+- 已修复 `EvidenceBuilder._summarize_code_evidence()` 的坏响应防御：
+  - 当 LLM 返回非 `dict` 时不再触发 `payload.get(...)` 崩溃
+  - 现在会稳定回退到本地结构化摘要
+- 已增强工作区右栏的 Agent 过程可视化：
+  - 使用 `st.status("Agent 正在推理...")` 展示 `[Current Plan] / [Thought] / [Action] / [Observation]`
+  - 代码画布保持 `white-space: pre` 与横向滚动
+  - 主容器宽度已收紧到 `max-width: 98vw`
+- 本轮重构已完成本地校验：
+  - `.\.tools\ruff\ruff.exe check app.py src tests`
+  - `.\.tools\ruff\ruff.exe format --check app.py src tests`
+  - `python -m pytest`
 
 ## TODO
 
