@@ -192,11 +192,33 @@ labflow-ai/
 ## 阶段 0 完成情况
 
 - 已初始化 Git 仓库
+- 已完成第一次提交：`chore: 初始化项目骨架与 Streamlit 首页`
 - 已创建基础目录结构与 `src` 目录布局
 - 已完成配置加载、环境变量样例与根目录启动入口
 - 已完成最小化 Streamlit 首页
 - 已补充单元测试与集成测试脚手架
 - 已完成本地校验：
+  - `ruff check app.py src tests`
+  - `ruff format --check app.py src tests`
+  - `pytest`
+  - `streamlit run app.py --server.headless true`
+
+## 阶段 1 当前进展
+
+- 已实现 `PDFParser`，支持：
+  - 本地文件解析
+  - 上传字节流解析
+  - 标题/正文块启发式区分
+  - PDF 路径不存在、空文件、加密文档等基础异常提示
+- 已实现 `GitRepoParser`，支持：
+  - 本地路径或仓库子目录定位仓库根
+  - 提取最近 10 次提交
+  - 提取当前工作区相对 `HEAD` 的 diff
+  - 路径不存在、非仓库路径等基础异常提示
+- 已在首页接入侧边栏：
+  - PDF 上传组件
+  - 本地 Git 路径输入框
+- 已完成阶段 1 当前范围内的本地校验：
   - `ruff check app.py src tests`
   - `ruff format --check app.py src tests`
   - `pytest`

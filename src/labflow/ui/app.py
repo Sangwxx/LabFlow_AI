@@ -1,9 +1,14 @@
 """Streamlit 首页。"""
 
+from __future__ import annotations
+
 import streamlit as st
 
 from labflow.config.settings import get_settings
+from labflow.parsers.git_repo_parser import GitRepoParser, GitRepoParseResult
+from labflow.parsers.pdf_parser import PDFParser, PDFParseResult
 from labflow.ui.home_content import HomeContent, build_home_content
+from labflow.ui.sidebar import SidebarState, render_sidebar
 
 
 def render_stage_cards(content: HomeContent) -> None:
@@ -31,6 +36,93 @@ def render_scope(title: str, items: tuple[str, ...]) -> None:
         st.markdown(f"- {item}")
 
 
+def render_parser_previews(sidebar_state: SidebarState) -> None:
+    """根据侧边栏输入展示解析预览。"""
+
+    st.markdown("## 感知预览")
+    left_column, right_column = st.columns(2)
+
+    with left_column:
+        render_pdf_preview(sidebar_state)
+    with right_column:
+        render_git_preview(sidebar_state)
+
+
+def render_pdf_preview(sidebar_state: SidebarState) -> None:
+    """展示 PDF 解析结果。"""
+
+    st.markdown("### PDF 解析")
+    if not sidebar_state.uploaded_pdf_bytes:
+        st.caption("上传 PDF 后，我会先把标题和正文块分开，方便后面的对齐推理。")
+        return
+
+    parser = PDFParser()
+    try:
+        result = parser.parse_bytes(
+            pdf_bytes=sidebar_state.uploaded_pdf_bytes,
+            source_name=sidebar_state.uploaded_pdf_name or "uploaded.pdf",
+        )
+    except (RuntimeError, ValueError) as exc:
+        st.error(str(exc))
+        return
+
+    st.success(f"已解析 {result.source_name}，共 {result.page_count} 页。")
+    st.caption(
+        f"识别出 {len(result.title_blocks)} 个标题块，{len(result.paragraph_blocks)} 个正文块。"
+    )
+    render_pdf_result(result)
+
+
+def render_pdf_result(result: PDFParseResult) -> None:
+    """渲染 PDF 解析结果摘要。"""
+
+    with st.expander("标题预览", expanded=True):
+        if not result.title_blocks:
+            st.caption("当前没有命中明显标题，我会在后续迭代里继续调规则。")
+        for block in result.title_blocks[:6]:
+            st.markdown(f"- P{block.page_number} · {block.text}")
+
+    with st.expander("正文字段预览", expanded=False):
+        for block in result.paragraph_blocks[:3]:
+            st.write(block.text)
+
+
+def render_git_preview(sidebar_state: SidebarState) -> None:
+    """展示 Git 仓库解析结果。"""
+
+    st.markdown("### Git 仓库解析")
+    if not sidebar_state.git_repo_path:
+        st.caption("填入本地仓库路径后，我会拉出最近 10 次提交和当前工作区 diff。")
+        return
+
+    parser = GitRepoParser()
+    try:
+        result = parser.parse(sidebar_state.git_repo_path)
+    except (FileNotFoundError, ValueError) as exc:
+        st.error(str(exc))
+        return
+
+    st.success(f"已定位仓库：{result.repo_path}")
+    st.caption(f"当前分支：{result.branch_name} · 最近提交数：{len(result.recent_commits)}")
+    render_git_result(result)
+
+
+def render_git_result(result: GitRepoParseResult) -> None:
+    """渲染 Git 仓库解析结果摘要。"""
+
+    with st.expander("最近 10 次提交", expanded=True):
+        if not result.recent_commits:
+            st.caption("这个仓库还没有提交记录。")
+        for commit in result.recent_commits:
+            st.markdown(f"- `{commit.short_sha}` {commit.summary} · {commit.author_name}")
+
+    with st.expander("当前工作区 diff", expanded=False):
+        if result.working_tree_diff:
+            st.code(result.working_tree_diff, language="diff")
+        else:
+            st.caption("当前工作区没有未提交变更。")
+
+
 def run() -> None:
     """运行首页界面。"""
 
@@ -43,6 +135,7 @@ def run() -> None:
         layout="wide",
         initial_sidebar_state="collapsed",
     )
+    sidebar_state = render_sidebar()
 
     st.markdown(
         """
@@ -194,7 +287,9 @@ def run() -> None:
     with right_column:
         render_scope("下一步实现", content.next_actions)
 
+    render_parser_previews(sidebar_state)
+
     st.info(
-        "启动阶段已完成：目录结构、配置加载、敏感文件忽略与最小首页已就绪。"
-        " 接下来可以进入 PDF 解析与本地仓库解析实现。"
+        "阶段 1 的感知层输入已经接好。"
+        " 接下来可以基于 PDF 结构块、提交历史和工作区 diff 继续推进对齐推理。"
     )
