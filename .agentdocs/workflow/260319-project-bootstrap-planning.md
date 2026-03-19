@@ -224,6 +224,28 @@ labflow-ai/
   - `pytest`
   - `streamlit run app.py --server.headless true`
 
+## 阶段 2 当前进展
+
+- 已实现推理层数据模型：
+  - `PaperSection`
+  - `CodeEvidence`
+  - `AlignmentCandidate`
+  - `AlignmentResult`
+- 已实现 `EvidenceBuilder`，支持：
+  - 从 PDF 结构块重组章节
+  - 从 Git diff 拆分文件级证据
+  - 基于 BM25 风格评分召回候选章节
+- 已实现 `PaperCodeAligner` 与模块级 `align()` / `align_inputs()` 入口
+- 已补充统一 `LLMClient`，通过 OpenAI 兼容接口请求模型并解析 JSON 结果
+- 已在首页接入推理层：
+  - 真实输入对齐按钮
+  - 内置参数错配案例展示
+- 已完成阶段 2 当前范围内的本地校验：
+  - `ruff check app.py src tests`
+  - `ruff format --check app.py src tests`
+  - `pytest`
+  - `streamlit run app.py --server.headless true`
+
 ## 风险与前置问题
 
 ### 已发现风险

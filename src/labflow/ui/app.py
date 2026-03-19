@@ -2,13 +2,53 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import streamlit as st
 
 from labflow.config.settings import get_settings
 from labflow.parsers.git_repo_parser import GitRepoParser, GitRepoParseResult
 from labflow.parsers.pdf_parser import PDFParser, PDFParseResult
+from labflow.reasoning.aligner import align, align_inputs
+from labflow.reasoning.models import AlignmentResult, CodeEvidence, PaperSection
 from labflow.ui.home_content import HomeContent, build_home_content
 from labflow.ui.sidebar import SidebarState, render_sidebar
+
+
+@dataclass(frozen=True)
+class ParsedWorkspace:
+    """当前页面解析出的输入状态。"""
+
+    pdf_result: PDFParseResult | None
+    pdf_error: str | None
+    git_result: GitRepoParseResult | None
+    git_error: str | None
+
+
+class DemoMismatchLLMClient:
+    """我先用一个可控假客户端把链路压通，联调时就不会被外部模型波动卡住。"""
+
+    def generate_json(self, *, system_prompt: str, user_prompt: str, **_: object) -> dict:
+        if "alpha = 0.70" in user_prompt and "alpha = 0.30" in user_prompt:
+            return {
+                "alignment_score": 0.18,
+                "match_type": "formula_mismatch",
+                "analysis": (
+                    "论文章节要求损失权重 alpha=0.70、beta=0.30，"
+                    "但代码片段里写成了 alpha=0.30、beta=0.70，"
+                    "变量名一致但系数被对调，属于公式实现偏离。"
+                ),
+                "improvement_suggestion": (
+                    "把 trainer.py 中的权重系数改回论文给出的比例，并补一条单测锁住参数顺序。"
+                ),
+            }
+
+        return {
+            "alignment_score": 0.62,
+            "match_type": "partial_match",
+            "analysis": "当前证据存在一定相关性，但还看不出完全闭环。",
+            "improvement_suggestion": "继续补充更完整的代码片段和公式上下文。",
+        }
 
 
 def render_stage_cards(content: HomeContent) -> None:
@@ -36,34 +76,66 @@ def render_scope(title: str, items: tuple[str, ...]) -> None:
         st.markdown(f"- {item}")
 
 
-def render_parser_previews(sidebar_state: SidebarState) -> None:
+def parse_sidebar_inputs(sidebar_state: SidebarState) -> ParsedWorkspace:
+    """把侧边栏输入统一解析出来，避免同一轮渲染重复跑多次。"""
+
+    pdf_result: PDFParseResult | None = None
+    pdf_error: str | None = None
+    git_result: GitRepoParseResult | None = None
+    git_error: str | None = None
+
+    if sidebar_state.uploaded_pdf_bytes:
+        try:
+            pdf_result = PDFParser().parse_bytes(
+                pdf_bytes=sidebar_state.uploaded_pdf_bytes,
+                source_name=sidebar_state.uploaded_pdf_name or "uploaded.pdf",
+            )
+        except (RuntimeError, ValueError) as exc:
+            pdf_error = str(exc)
+
+    if sidebar_state.git_repo_path:
+        try:
+            git_result = GitRepoParser().parse(sidebar_state.git_repo_path)
+        except (FileNotFoundError, ValueError) as exc:
+            git_error = str(exc)
+
+    return ParsedWorkspace(
+        pdf_result=pdf_result,
+        pdf_error=pdf_error,
+        git_result=git_result,
+        git_error=git_error,
+    )
+
+
+def render_parser_previews(parsed_workspace: ParsedWorkspace) -> None:
     """根据侧边栏输入展示解析预览。"""
 
     st.markdown("## 感知预览")
     left_column, right_column = st.columns(2)
 
     with left_column:
-        render_pdf_preview(sidebar_state)
+        render_pdf_preview(parsed_workspace)
     with right_column:
-        render_git_preview(sidebar_state)
+        render_git_preview(parsed_workspace)
+
+    render_reasoning_panel(parsed_workspace)
 
 
-def render_pdf_preview(sidebar_state: SidebarState) -> None:
+def render_pdf_preview(parsed_workspace: ParsedWorkspace) -> None:
     """展示 PDF 解析结果。"""
 
     st.markdown("### PDF 解析")
-    if not sidebar_state.uploaded_pdf_bytes:
+    if parsed_workspace.pdf_result is None and parsed_workspace.pdf_error is None:
         st.caption("上传 PDF 后，我会先把标题和正文块分开，方便后面的对齐推理。")
         return
 
-    parser = PDFParser()
-    try:
-        result = parser.parse_bytes(
-            pdf_bytes=sidebar_state.uploaded_pdf_bytes,
-            source_name=sidebar_state.uploaded_pdf_name or "uploaded.pdf",
-        )
-    except (RuntimeError, ValueError) as exc:
-        st.error(str(exc))
+    if parsed_workspace.pdf_error:
+        st.error(parsed_workspace.pdf_error)
+        return
+
+    result = parsed_workspace.pdf_result
+    if result is None:
+        st.error("PDF 解析结果为空。")
         return
 
     st.success(f"已解析 {result.source_name}，共 {result.page_count} 页。")
@@ -87,19 +159,21 @@ def render_pdf_result(result: PDFParseResult) -> None:
             st.write(block.text)
 
 
-def render_git_preview(sidebar_state: SidebarState) -> None:
+def render_git_preview(parsed_workspace: ParsedWorkspace) -> None:
     """展示 Git 仓库解析结果。"""
 
     st.markdown("### Git 仓库解析")
-    if not sidebar_state.git_repo_path:
+    if parsed_workspace.git_result is None and parsed_workspace.git_error is None:
         st.caption("填入本地仓库路径后，我会拉出最近 10 次提交和当前工作区 diff。")
         return
 
-    parser = GitRepoParser()
-    try:
-        result = parser.parse(sidebar_state.git_repo_path)
-    except (FileNotFoundError, ValueError) as exc:
-        st.error(str(exc))
+    if parsed_workspace.git_error:
+        st.error(parsed_workspace.git_error)
+        return
+
+    result = parsed_workspace.git_result
+    if result is None:
+        st.error("Git 仓库解析结果为空。")
         return
 
     st.success(f"已定位仓库：{result.repo_path}")
@@ -123,6 +197,98 @@ def render_git_result(result: GitRepoParseResult) -> None:
             st.caption("当前工作区没有未提交变更。")
 
 
+def render_reasoning_panel(parsed_workspace: ParsedWorkspace) -> None:
+    """渲染推理层入口和内置案例。"""
+
+    st.markdown("## 推理预览")
+    left_column, right_column = st.columns([1.1, 0.9])
+    with left_column:
+        render_live_alignment_panel(parsed_workspace)
+    with right_column:
+        render_demo_alignment_case()
+
+
+def render_live_alignment_panel(parsed_workspace: ParsedWorkspace) -> None:
+    """展示真实输入的对齐入口。"""
+
+    st.markdown("### 真实输入对齐")
+    if parsed_workspace.pdf_result is None or parsed_workspace.git_result is None:
+        st.caption("把 PDF 和本地 Git 仓库都准备好后，我就能跑一次真实对齐。")
+        return
+
+    if st.button("运行对齐分析", type="primary", use_container_width=True):
+        with st.spinner("我在压缩候选证据，并让模型做结构化判断..."):
+            try:
+                results = align(parsed_workspace.pdf_result, parsed_workspace.git_result)
+            except RuntimeError as exc:
+                st.error(str(exc))
+                return
+        render_alignment_results(results)
+
+
+def render_demo_alignment_case() -> None:
+    """展示一个参数错配案例，先把推理链路跑通。"""
+
+    st.markdown("### 内置错配案例")
+    st.caption("这组样例专门模拟“论文公式写的是一套权重，代码里却把参数写反了”的情况。")
+    demo_results = align_inputs(
+        paper_sections=(
+            PaperSection(
+                title="3.2 损失函数权重",
+                content=(
+                    "论文要求总损失写成 L = alpha * L_cls + beta * L_reg，"
+                    "其中 alpha = 0.70，beta = 0.30。"
+                ),
+                level=2,
+                page_number=3,
+                order=5,
+            ),
+        ),
+        code_evidences=(
+            CodeEvidence(
+                file_name="trainer.py",
+                code_snippet=(
+                    "alpha = 0.30\nbeta = 0.70\nloss = alpha * cls_loss + beta * reg_loss"
+                ),
+                related_git_diff=(
+                    "@@ -10,3 +10,3 @@\n-alpha = 0.70\n+alpha = 0.30\n-beta = 0.30\n+beta = 0.70"
+                ),
+                symbols=("alpha", "beta", "loss", "cls_loss", "reg_loss"),
+                commit_context=("fix: 调整训练权重",),
+            ),
+        ),
+        llm_client=DemoMismatchLLMClient(),
+        top_k=1,
+    )
+    render_alignment_results(demo_results)
+
+
+def render_alignment_results(results: tuple[AlignmentResult, ...]) -> None:
+    """渲染对齐结果。"""
+
+    if not results:
+        st.warning("当前没有召回到可分析的候选对。")
+        return
+
+    for result in results:
+        score_label = f"{result.alignment_score:.2f}"
+        title = f"{result.paper_section_title} ↔ {result.code_file_name}"
+        st.markdown(
+            f"""
+            <div class="stage-card" style="min-height: 0; margin-bottom: 1rem;">
+                <div class="stage-step">{result.match_type}</div>
+                <div class="stage-title">{title}</div>
+                <div class="stage-body">
+                    <strong>对齐评分：</strong>{score_label}<br/>
+                    <strong>分析结论：</strong>{result.analysis}<br/>
+                    <strong>改进建议：</strong>{result.improvement_suggestion}
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+
 def run() -> None:
     """运行首页界面。"""
 
@@ -136,6 +302,7 @@ def run() -> None:
         initial_sidebar_state="collapsed",
     )
     sidebar_state = render_sidebar()
+    parsed_workspace = parse_sidebar_inputs(sidebar_state)
 
     st.markdown(
         """
@@ -252,7 +419,7 @@ def run() -> None:
     st.markdown(
         f"""
         <section class="hero">
-            <div class="hero-kicker">HUST AI Competition / Stage 0</div>
+            <div class="hero-kicker">HUST AI Competition / Stage 2</div>
             <div class="hero-title">{content.title}</div>
             <div class="hero-subtitle">{content.subtitle}</div>
         </section>
@@ -263,8 +430,8 @@ def run() -> None:
     metric_columns = st.columns(3)
     metrics = (
         ("当前重点", "论文-代码对齐分析"),
-        ("Git 输入", "本地路径导入"),
-        ("PDF 范围", "仅文本型 PDF"),
+        ("检索策略", "BM25 轻量召回"),
+        ("推理模式", "结构化 JSON 输出"),
     )
     for column, metric in zip(metric_columns, metrics, strict=False):
         label, value = metric
@@ -287,9 +454,9 @@ def run() -> None:
     with right_column:
         render_scope("下一步实现", content.next_actions)
 
-    render_parser_previews(sidebar_state)
+    render_parser_previews(parsed_workspace)
 
     st.info(
-        "阶段 1 的感知层输入已经接好。"
-        " 接下来可以基于 PDF 结构块、提交历史和工作区 diff 继续推进对齐推理。"
+        "阶段 2 的推理层入口已经接好。"
+        " 现在既可以用内置错配案例验证链路，也可以在模型依赖齐全时对真实输入发起分析。"
     )
