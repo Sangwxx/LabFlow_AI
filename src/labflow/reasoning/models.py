@@ -16,6 +16,7 @@ ToolName = Literal[
     "list_project_structure",
     "read_code_segment",
     "llm_semantic_search",
+    "find_definition",
 ]
 
 
@@ -48,6 +49,12 @@ class CodeEvidence:
     start_line: int = 1
     end_line: int = 1
     language: str = "python"
+    absolute_path: str = ""
+    source_content: str = ""
+    symbol_name: str = ""
+    parent_symbol: str = ""
+    block_type: str = "snippet"
+    docstring: str = ""
 
     @property
     def combined_text(self) -> str:
@@ -170,6 +177,9 @@ class AlignmentResult:
     retrieval_score: float
     semantic_evidence: str = ""
     research_supplement: str = ""
+    evidence_level: str = ""
+    operator_alignment: str = ""
+    shape_alignment: str = ""
     highlighted_line_numbers: tuple[int, ...] = ()
     code_snippet: str = ""
     code_language: str = "python"
@@ -238,6 +248,9 @@ class AlignmentResult:
                 payload.get("semantic_evidence", payload.get("analysis", "当前缺少语义证据。"))
             ).strip(),
             research_supplement=str(payload.get("research_supplement", "")).strip(),
+            evidence_level=str(payload.get("evidence_level", "")).strip(),
+            operator_alignment=str(payload.get("operator_alignment", "")).strip(),
+            shape_alignment=str(payload.get("shape_alignment", "")).strip(),
             highlighted_line_numbers=highlighted_lines,
             code_snippet=candidate.code_evidence.code_snippet,
             code_language=candidate.code_evidence.language,

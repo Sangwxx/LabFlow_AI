@@ -65,6 +65,30 @@ def build_text_block(
     }
 
 
+def build_multiline_text_block(
+    lines: list[str],
+    font_size: float,
+    *,
+    bbox: tuple[float, float, float, float] = (10.0, 20.0, 200.0, 60.0),
+) -> dict:
+    """构造一个带多行文本的 PDF block。"""
+
+    return {
+        "bbox": bbox,
+        "lines": [
+            {
+                "spans": [
+                    {
+                        "text": line,
+                        "size": font_size,
+                    }
+                ]
+            }
+            for line in lines
+        ],
+    }
+
+
 def test_pdf_parser_classifies_title_and_paragraph(monkeypatch) -> None:
     """我会用字号和文本形态把标题与正文区分开。"""
 
@@ -130,6 +154,37 @@ def test_pdf_parser_supports_bytesio_stream(monkeypatch) -> None:
 
     assert result.source_name == "stream.pdf"
     assert result.title_blocks[0].text == "2 Method"
+
+
+def test_pdf_parser_normalizes_linebreak_and_hyphenation(monkeypatch) -> None:
+    """跨行断词和换行应尽量还原成自然段文本。"""
+
+    fake_document = FakeDocument(
+        pages=[
+            FakePage(
+                [
+                    build_text_block("Abstract", 17),
+                    build_multiline_text_block(
+                        [
+                            "Following language instructions to navigate in unseen",
+                            "environments is a challenging problem for autonomous em-",
+                            "bodied agents.",
+                        ],
+                        11,
+                    ),
+                ]
+            )
+        ]
+    )
+    fake_fitz = SimpleNamespace(open=lambda **_: fake_document)
+    monkeypatch.setattr("labflow.parsers.pdf_parser._load_fitz_module", lambda: fake_fitz)
+
+    result = PDFParser().parse_bytes(b"demo-pdf", source_name="normalized.pdf")
+
+    assert result.paragraph_blocks[0].text == (
+        "Following language instructions to navigate in unseen "
+        "environments is a challenging problem for autonomous embodied agents."
+    )
 
 
 def test_pdf_parser_requires_existing_file() -> None:

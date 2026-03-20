@@ -1,9 +1,12 @@
 """证据构建器测试。"""
 
+import shutil
+from pathlib import Path
+
 from labflow.parsers.git_repo_parser import CommitInfo, GitRepoParseResult, SourceFile
 from labflow.parsers.pdf_parser import PDFBlock, PDFParseResult
 from labflow.reasoning.evidence_builder import EvidenceBuilder
-from labflow.reasoning.models import CodeEvidence
+from labflow.reasoning.models import CodeEvidence, PaperSection
 
 
 class FakeBrokenSemanticLLMClient:
@@ -61,6 +64,7 @@ def test_evidence_builder_builds_focus_sections_for_paragraph_clicks() -> None:
                 page_number=1,
                 order=1,
                 font_size=11,
+                bbox=(20.0, 100.0, 420.0, 126.0),
             ),
             PDFBlock(
                 kind="paragraph",
@@ -68,6 +72,7 @@ def test_evidence_builder_builds_focus_sections_for_paragraph_clicks() -> None:
                 page_number=1,
                 order=2,
                 font_size=11,
+                bbox=(20.0, 170.0, 430.0, 196.0),
             ),
         ),
     )
@@ -78,6 +83,42 @@ def test_evidence_builder_builds_focus_sections_for_paragraph_clicks() -> None:
     assert focus_sections[0].title == "2 Method"
     assert focus_sections[0].order == 1
     assert "recurrent memory" in focus_sections[0].content
+
+
+def test_evidence_builder_merges_adjacent_blocks_into_natural_paragraph() -> None:
+    """相邻正文块如果属于同一段，应合并后再交给阅读工作区。"""
+
+    pdf_result = PDFParseResult(
+        source_name="paper.pdf",
+        page_count=1,
+        blocks=(
+            PDFBlock(kind="title", text="Abstract", page_number=1, order=0, font_size=18),
+            PDFBlock(
+                kind="paragraph",
+                text="Following language instructions to navigate in unseen environments",
+                page_number=1,
+                order=1,
+                font_size=11,
+                bbox=(20.0, 100.0, 400.0, 128.0),
+            ),
+            PDFBlock(
+                kind="paragraph",
+                text="is a challenging problem for autonomous embodied agents.",
+                page_number=1,
+                order=2,
+                font_size=11,
+                bbox=(20.0, 129.0, 420.0, 156.0),
+            ),
+        ),
+    )
+
+    focus_sections = EvidenceBuilder().build_focus_sections(pdf_result)
+
+    assert len(focus_sections) == 1
+    assert focus_sections[0].content == (
+        "Following language instructions to navigate in unseen environments "
+        "is a challenging problem for autonomous embodied agents."
+    )
 
 
 def test_evidence_builder_recalls_relevant_section_from_diff() -> None:
@@ -275,3 +316,101 @@ def test_evidence_builder_can_trace_related_candidates_by_symbol_chain() -> None
 
     assert traced_candidates
     assert traced_candidates[0].code_evidence.file_name == "projection.py"
+
+
+def test_evidence_builder_reads_ast_logic_block_with_docstring() -> None:
+    """read_code_segment 现在应该返回完整逻辑块，而不是生硬的行切片。"""
+
+    builder = EvidenceBuilder()
+    evidences = (
+        CodeEvidence(
+            file_name="encoder.py",
+            code_snippet=(
+                "def build_encoder(x):\n"
+                '    """Fuse visual and language features."""\n'
+                "    hidden = self.fuse(x)\n"
+                "    return self.norm(hidden)\n"
+            ),
+            related_git_diff="",
+            symbols=("build_encoder", "fuse", "norm"),
+            commit_context=(),
+            start_line=10,
+            end_line=13,
+            symbol_name="build_encoder",
+            block_type="function",
+            docstring="Fuse visual and language features.",
+        ),
+    )
+
+    summary, _ = builder.read_logic_block(
+        evidences,
+        path="encoder.py",
+        line_start=11,
+        line_end=12,
+    )
+
+    assert "逻辑块类型: function" in summary
+    assert "Fuse visual and language features." in summary
+    assert "hidden = self.fuse(x)" in summary
+
+
+def test_evidence_builder_can_find_definition_across_files() -> None:
+    """Jedi 应该能把函数调用追到跨文件定义源头。"""
+
+    repo_root = Path(".tmp/test-jedi-repo")
+    if repo_root.exists():
+        shutil.rmtree(repo_root, ignore_errors=True)
+    repo_root.mkdir(parents=True, exist_ok=True)
+    (repo_root / "encoder.py").write_text(
+        "from projection import project_tokens\n\n"
+        "def build_encoder(x):\n"
+        "    return project_tokens(x)\n",
+        encoding="utf-8",
+    )
+    (repo_root / "projection.py").write_text(
+        "def project_tokens(x):\n"
+        '    """Project tokens into a shared space."""\n'
+        "    return linear(x)\n",
+        encoding="utf-8",
+    )
+
+    repo_result = GitRepoParseResult(
+        repo_path=str(repo_root),
+        branch_name="UNVERSIONED",
+        recent_commits=(),
+        working_tree_diff="",
+        source_files=(
+            SourceFile(
+                relative_path="encoder.py",
+                content=(repo_root / "encoder.py").read_text(encoding="utf-8"),
+            ),
+            SourceFile(
+                relative_path="projection.py",
+                content=(repo_root / "projection.py").read_text(encoding="utf-8"),
+            ),
+        ),
+        source_type="directory",
+    )
+
+    builder = EvidenceBuilder()
+    evidences = builder.build_code_evidences(repo_result)
+    paper_section = PaperSection(
+        title="3.1 Shared Projection",
+        content="The encoder projects tokens into a shared feature space.",
+        level=2,
+        page_number=3,
+        order=2,
+    )
+
+    observation, candidates = builder.find_definition_candidate(
+        paper_section,
+        evidences,
+        symbol="project_tokens",
+        file_path="encoder.py",
+        line=4,
+        column=11,
+    )
+
+    assert candidates
+    assert candidates[0].code_evidence.file_name == "projection.py"
+    assert "project_tokens" in observation

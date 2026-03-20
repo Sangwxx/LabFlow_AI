@@ -136,6 +136,33 @@ class FakeUnavailableLLMClient:
         return None
 
 
+class FakeStructuredStringLLMClient(FakeUnavailableLLMClient):
+    """我专门模拟模型把结构化对象塞进字符串字段里的脏输出。"""
+
+    def generate_json(self, *, system_prompt: str, **_: object) -> dict | None:
+        if "学术导读模式" in system_prompt:
+            return {
+                "analysis": (
+                    "{'paper_title': 'DUET', 'core_problem': 'Vision-Language Navigation "
+                    "requires agents to follow natural language instructions in unseen "
+                    "environments.'}"
+                ),
+                "semantic_evidence": (
+                    "{'core_problem': 'Vision-Language Navigation requires agents to follow "
+                    "natural language instructions in unseen environments.', "
+                    "'key_innovation': 'The method uses a dual-scale architecture.', "
+                    "'technical_approach': 'It combines local grounding with global planning.'}"
+                ),
+                "research_supplement": (
+                    "{'related_concepts': {'Embodied AI': 'Embodied AI is about agents acting "
+                    "in the world.', 'Unseen Environment': 'An unseen environment is a new "
+                    "scene not observed during training.'}, 'significance': 'This setting tests "
+                    "generalization.'}"
+                ),
+            }
+        return None
+
+
 def test_plan_and_execute_agent_builds_plan_and_traces() -> None:
     """Agent 应先规划，再按需执行，并保留执行轨迹。"""
 
@@ -301,6 +328,113 @@ def test_agent_falls_back_when_llm_is_unavailable() -> None:
     assert result is not None
     assert result.match_type == "partial_match"
     assert result.needs_manual_review is True
+
+
+def test_agent_prescreens_introduction_into_academic_guide_mode() -> None:
+    """引言类片段应直接切到学术导读模式，而不是去代码库里乱撞。"""
+
+    section = PaperSection(
+        title="1 Introduction",
+        content=(
+            "Vision-and-language navigation studies how an embodied agent follows instructions."
+        ),
+        level=1,
+        page_number=1,
+        order=1,
+    )
+    evidences = (
+        CodeEvidence(
+            file_name="models/agent.py",
+            code_snippet="class Agent:\n    pass\n",
+            related_git_diff="",
+            symbols=("Agent",),
+            commit_context=(),
+            start_line=1,
+            end_line=2,
+        ),
+    )
+
+    result = PlanAndExecuteAgent(
+        llm_client=FakeUnavailableLLMClient(),
+        evidence_builder=EvidenceBuilder(),
+    ).run(
+        section,
+        evidences,
+        project_structure="models / agent.py",
+    )
+
+    assert result is not None
+    assert result.match_type == "missing_implementation"
+    assert "学术导读" in result.retrieval_plan
+    assert "代码对齐" in result.confidence_note
+
+
+def test_agent_refuses_to_force_irrelevant_method_alignment() -> None:
+    """方法段若缺少可靠代码支撑，应诚实拒绝硬凑实现。"""
+
+    section = PaperSection(
+        title="3 Method",
+        content="We derive a theoretical objective and discuss its optimization motivation.",
+        level=2,
+        page_number=4,
+        order=5,
+    )
+    evidences = (
+        CodeEvidence(
+            file_name="utils/io.py",
+            code_snippet="def load_yaml(path):\n    return path.read_text()\n",
+            related_git_diff="",
+            symbols=("load_yaml",),
+            commit_context=(),
+            start_line=3,
+            end_line=4,
+        ),
+    )
+
+    result = PlanAndExecuteAgent(
+        llm_client=FakeUnavailableLLMClient(),
+        evidence_builder=EvidenceBuilder(),
+    ).run(
+        section,
+        evidences,
+        project_structure="utils / io.py",
+    )
+
+    assert result is not None
+    assert result.match_type == "missing_implementation"
+    assert "theoretical objective" in result.analysis
+    assert result.semantic_evidence.count("- ") == 3
+    assert "无直接对应的算子实现" in result.confidence_note
+
+
+def test_agent_sanitizes_structured_string_output_into_learning_sections() -> None:
+    """即使模型把字典字符串塞进字段里，最终展示也必须是可读内容而不是原始对象。"""
+
+    section = PaperSection(
+        title="1 Introduction",
+        content=(
+            "Vision-Language Navigation requires agents to follow natural language "
+            "instructions in unseen environments."
+        ),
+        level=1,
+        page_number=1,
+        order=1,
+    )
+
+    result = PlanAndExecuteAgent(
+        llm_client=FakeStructuredStringLLMClient(),
+        evidence_builder=EvidenceBuilder(),
+    ).run(
+        section,
+        (),
+        project_structure="",
+    )
+
+    assert result is not None
+    assert not result.analysis.startswith("{")
+    assert not result.research_supplement.startswith("{")
+    assert result.semantic_evidence.count("- ") == 3
+    assert "Embodied AI" in result.research_supplement
 
 
 def test_aligner_class_keeps_compatibility_entrypoint() -> None:

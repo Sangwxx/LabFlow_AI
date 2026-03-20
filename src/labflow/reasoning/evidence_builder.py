@@ -1,11 +1,13 @@
-"""基于轻量检索与语义索引的证据构建器。"""
+"""基于轻量检索、AST 逻辑块与 Jedi 定义追踪的证据构建器。"""
 
 from __future__ import annotations
 
+import ast
 import math
 import re
 from collections import Counter
-from pathlib import PurePosixPath
+from importlib import import_module
+from pathlib import Path, PurePosixPath
 
 from labflow.clients.llm_client import LLMClient
 from labflow.parsers.git_repo_parser import GitRepoParseResult, SourceFile
@@ -25,6 +27,29 @@ SYMBOL_DEFINITION_PATTERN = re.compile(
     re.MULTILINE,
 )
 SYMBOL_CALL_PATTERN = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)\(")
+OPERATOR_SIGNAL_PATTERNS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("softmax", ("softmax", "f.softmax", "nn.softmax")),
+    ("attention", ("attention", "attn", "q_proj", "k_proj", "v_proj")),
+    ("normalization", ("layernorm", "batchnorm", "norm(")),
+    ("fusion", ("concat", "cat(", "stack(", "fuse", "fusion")),
+    ("reshape", ("reshape", "view(", "permute", "transpose", "flatten")),
+    ("dropout", ("dropout", "f.dropout")),
+)
+SHAPE_SIGNAL_MARKERS = (
+    "shape",
+    "size(",
+    "reshape",
+    "view(",
+    "permute",
+    "transpose",
+    "flatten",
+    "unsqueeze",
+    "squeeze",
+    "dim=",
+    "dim =",
+    "head",
+    "heads",
+)
 PYTHON_KEYWORDS = {
     "if",
     "for",
@@ -42,7 +67,7 @@ PYTHON_KEYWORDS = {
 
 
 class EvidenceBuilder:
-    """我把仓库切成可追踪的语义单元，让 Agent 能从召回走向逻辑追踪。"""
+    """我负责把仓库切成 Agent 真能追逻辑的证据单元。"""
 
     def build_project_structure(
         self,
@@ -50,8 +75,6 @@ class EvidenceBuilder:
         *,
         max_items: int = 60,
     ) -> str:
-        """初始化阶段只构建文件树，不触发任何 LLM 行为。"""
-
         source_files = repo_result.source_files[:max_items]
         return self.build_project_structure_from_evidences(
             tuple(
@@ -72,44 +95,90 @@ class EvidenceBuilder:
         *,
         max_items: int = 60,
     ) -> str:
-        """从代码证据提取稳定文件树文本。"""
-
         unique_paths = list(dict.fromkeys(evidence.file_name for evidence in code_evidences))
         if not unique_paths:
             return "当前代码目录为空。"
         return "\n".join(" / ".join(path.split("/")) for path in unique_paths[:max_items])
 
     def build_focus_sections(self, pdf_result: PDFParseResult) -> tuple[PaperSection, ...]:
-        """把每一个正文块转成可点击的阅读焦点，兼顾段落粒度和章节上下文。"""
-
         focus_sections: list[PaperSection] = []
         current_title = "未命名章节"
         current_level = 1
+        paragraph_blocks: list[PDFBlock] = []
 
         for block in pdf_result.blocks:
             if block.kind == "title":
+                self._flush_focus_section_group(
+                    focus_sections=focus_sections,
+                    current_title=current_title,
+                    current_level=current_level,
+                    paragraph_blocks=paragraph_blocks,
+                )
                 current_title = block.text
                 current_level = self._infer_section_level(block)
+                paragraph_blocks = []
                 continue
 
             if not block.text.strip():
                 continue
 
-            focus_sections.append(
-                PaperSection(
-                    title=current_title,
-                    content=block.text,
-                    level=current_level,
-                    page_number=block.page_number,
-                    order=block.order,
+            if paragraph_blocks and not self._should_merge_focus_block(paragraph_blocks[-1], block):
+                self._flush_focus_section_group(
+                    focus_sections=focus_sections,
+                    current_title=current_title,
+                    current_level=current_level,
+                    paragraph_blocks=paragraph_blocks,
                 )
-            )
+                paragraph_blocks = []
+            paragraph_blocks.append(block)
+
+        self._flush_focus_section_group(
+            focus_sections=focus_sections,
+            current_title=current_title,
+            current_level=current_level,
+            paragraph_blocks=paragraph_blocks,
+        )
 
         return tuple(focus_sections)
 
-    def build_paper_sections(self, pdf_result: PDFParseResult) -> tuple[PaperSection, ...]:
-        """把 PDF 结构块重组为章节对象。"""
+    def _flush_focus_section_group(
+        self,
+        *,
+        focus_sections: list[PaperSection],
+        current_title: str,
+        current_level: int,
+        paragraph_blocks: list[PDFBlock],
+    ) -> None:
+        if not paragraph_blocks:
+            return
+        merged_content = " ".join(
+            block.text.strip() for block in paragraph_blocks if block.text.strip()
+        )
+        merged_content = " ".join(merged_content.split())
+        first_block = paragraph_blocks[0]
+        focus_sections.append(
+            PaperSection(
+                title=current_title,
+                content=merged_content,
+                level=current_level,
+                page_number=first_block.page_number,
+                order=first_block.order,
+            )
+        )
 
+    def _should_merge_focus_block(self, previous_block: PDFBlock, current_block: PDFBlock) -> bool:
+        if previous_block.page_number != current_block.page_number:
+            return False
+        previous_gap = current_block.bbox[1] - previous_block.bbox[3]
+        max_gap = max(previous_block.font_size, current_block.font_size) * 1.8
+        left_offset = abs(current_block.bbox[0] - previous_block.bbox[0])
+        if previous_gap > max_gap:
+            return False
+        if left_offset > max(previous_block.font_size, current_block.font_size) * 2.5:
+            return False
+        return True
+
+    def build_paper_sections(self, pdf_result: PDFParseResult) -> tuple[PaperSection, ...]:
         sections: list[PaperSection] = []
         current_title = "未命名章节"
         current_level = 1
@@ -147,13 +216,14 @@ class EvidenceBuilder:
         return tuple(section for section in sections if section.content.strip())
 
     def build_code_evidences(self, repo_result: GitRepoParseResult) -> tuple[CodeEvidence, ...]:
-        """把 Git diff 和源文件切成可展示、可追踪的代码证据。"""
-
         commit_context = tuple(commit.summary for commit in repo_result.recent_commits)
+        repo_root = Path(repo_result.repo_path)
+
         if repo_result.source_files:
             diff_lookup = self._build_diff_lookup(repo_result.working_tree_diff)
             evidences = self._build_source_file_evidences(
                 repo_result.source_files,
+                repo_root=repo_root,
                 commit_context=commit_context,
                 diff_lookup=diff_lookup,
             )
@@ -184,8 +254,6 @@ class EvidenceBuilder:
         *,
         llm_client: LLMClient | None = None,
     ) -> tuple[CodeSemanticSummary, ...]:
-        """先把仓库扫描成语义摘要，给 Agent 后续循环检索提供稳定索引。"""
-
         return self.build_semantic_index_from_evidences(
             self.build_code_evidences(repo_result),
             llm_client=llm_client,
@@ -197,8 +265,6 @@ class EvidenceBuilder:
         *,
         llm_client: LLMClient | None = None,
     ) -> tuple[CodeSemanticSummary, ...]:
-        """从代码证据生成语义索引条目。"""
-
         summaries: list[CodeSemanticSummary] = []
         for evidence in code_evidences:
             summaries.append(self._summarize_code_evidence(evidence, llm_client=llm_client))
@@ -211,8 +277,6 @@ class EvidenceBuilder:
         *,
         top_k: int = 4,
     ) -> tuple[AlignmentCandidate, ...]:
-        """利用代码语义摘要做首轮候选召回。"""
-
         if not semantic_index:
             return ()
 
@@ -250,8 +314,6 @@ class EvidenceBuilder:
         seen_candidate_ids: set[str] | None = None,
         limit: int = 4,
     ) -> tuple[AlignmentCandidate, ...]:
-        """根据调用链或符号链做二次追踪，帮助 Agent 从片段走向实现链路。"""
-
         normalized_symbols = {symbol.lower() for symbol in trace_symbols if symbol}
         if not normalized_symbols:
             return ()
@@ -288,8 +350,6 @@ class EvidenceBuilder:
         repo_result: GitRepoParseResult,
         top_k: int = 2,
     ) -> tuple[AlignmentCandidate, ...]:
-        """兼容原有批量候选召回接口。"""
-
         paper_sections = self.build_paper_sections(pdf_result)
         code_evidences = self.build_code_evidences(repo_result)
         return self.build_alignment_candidates_from_inputs(
@@ -304,8 +364,6 @@ class EvidenceBuilder:
         code_evidences: tuple[CodeEvidence, ...],
         top_k: int = 2,
     ) -> tuple[AlignmentCandidate, ...]:
-        """对任意章节/证据输入执行轻量召回。"""
-
         if not paper_sections or not code_evidences:
             return ()
 
@@ -344,43 +402,340 @@ class EvidenceBuilder:
         candidates.sort(key=lambda item: item.retrieval_score, reverse=True)
         return tuple(candidates)
 
+    def read_logic_block(
+        self,
+        code_evidences: tuple[CodeEvidence, ...],
+        *,
+        path: str,
+        line_start: int,
+        line_end: int,
+    ) -> tuple[str, tuple[str, ...]]:
+        evidence = self._find_best_evidence(
+            code_evidences,
+            path=path,
+            line_start=line_start,
+            line_end=line_end,
+        )
+        if evidence is None:
+            return "没有找到指定代码段。", ()
+
+        docstring = evidence.docstring.strip() or "无"
+        summary = (
+            f"文件: {evidence.file_name}\n"
+            f"逻辑块类型: {evidence.block_type}\n"
+            f"符号: {evidence.symbol_name or '未命名逻辑块'}\n"
+            f"范围: L{evidence.start_line}-L{evidence.end_line}\n"
+            f"Docstring: {docstring}\n\n"
+            f"代码:\n{evidence.code_snippet}"
+        )
+        return summary, (self._candidate_id_from_evidence(evidence),)
+
+    def find_definition_candidate(
+        self,
+        paper_section: PaperSection,
+        code_evidences: tuple[CodeEvidence, ...],
+        *,
+        symbol: str,
+        file_path: str,
+        line: int,
+        column: int,
+    ) -> tuple[str, tuple[AlignmentCandidate, ...]]:
+        base_evidence = self._find_best_evidence(
+            code_evidences,
+            path=file_path,
+            line_start=line,
+            line_end=line,
+        )
+        if base_evidence is None:
+            return "没有找到用于跳转定义的起始代码块。", ()
+
+        if not base_evidence.absolute_path or not base_evidence.source_content:
+            fallback = self._find_symbol_candidate_by_name(
+                paper_section,
+                code_evidences,
+                symbol=symbol,
+            )
+            if fallback is None:
+                return "当前代码块缺少可供 Jedi 跳转的源码上下文。", ()
+            observation = self._build_definition_observation(
+                symbol,
+                fallback.code_evidence,
+                reason="Jedi 上下文不足，已退回到仓库内符号搜索。",
+            )
+            return observation, (fallback,)
+
+        target_evidence = self._resolve_definition_with_jedi(
+            paper_section,
+            code_evidences,
+            symbol=symbol,
+            file_path=file_path,
+            line=line,
+            column=column,
+            base_evidence=base_evidence,
+        )
+        if target_evidence is None:
+            fallback = self._find_symbol_candidate_by_name(
+                paper_section,
+                code_evidences,
+                symbol=symbol,
+            )
+            if fallback is None:
+                return f"没有在仓库内追踪到符号 `{symbol}` 的定义。", ()
+            observation = self._build_definition_observation(
+                symbol,
+                fallback.code_evidence,
+                reason="Jedi 未给出稳定结果，已退回到仓库内符号搜索。",
+            )
+            return observation, (fallback,)
+
+        observation = self._build_definition_observation(symbol, target_evidence.code_evidence)
+        return observation, (target_evidence,)
+
     def _build_source_file_evidences(
         self,
         source_files: tuple[SourceFile, ...],
         *,
+        repo_root: Path,
         commit_context: tuple[str, ...],
         diff_lookup: dict[str, str],
     ) -> list[CodeEvidence]:
-        """把源代码文件切成可读片段，给右栏检查器提供带行号的真实代码。"""
-
         evidences: list[CodeEvidence] = []
         for source_file in source_files:
-            chunks = self._chunk_source_file(source_file)
-            for start_line, end_line, code_snippet in chunks:
-                symbols = tuple(
-                    self._extract_symbols(f"{source_file.relative_path}\n{code_snippet}")
-                )
+            if source_file.language == "python":
+                chunks = self._chunk_python_source_file(source_file, repo_root=repo_root)
+            else:
+                chunks = self._chunk_plain_source_file(source_file, repo_root=repo_root)
+
+            if not chunks:
+                chunks = self._chunk_plain_source_file(source_file, repo_root=repo_root)
+
+            for evidence in chunks:
                 evidences.append(
                     CodeEvidence(
-                        file_name=source_file.relative_path,
-                        code_snippet=code_snippet,
-                        related_git_diff=diff_lookup.get(source_file.relative_path, ""),
-                        symbols=symbols,
+                        file_name=evidence.file_name,
+                        code_snippet=evidence.code_snippet,
+                        related_git_diff=diff_lookup.get(evidence.file_name, ""),
+                        symbols=evidence.symbols,
                         commit_context=commit_context,
-                        start_line=start_line,
-                        end_line=end_line,
-                        language=source_file.language,
+                        start_line=evidence.start_line,
+                        end_line=evidence.end_line,
+                        language=evidence.language,
+                        absolute_path=evidence.absolute_path,
+                        source_content=evidence.source_content,
+                        symbol_name=evidence.symbol_name,
+                        parent_symbol=evidence.parent_symbol,
+                        block_type=evidence.block_type,
+                        docstring=evidence.docstring,
                     )
                 )
         return evidences
+
+    def _chunk_python_source_file(
+        self,
+        source_file: SourceFile,
+        *,
+        repo_root: Path,
+        max_chunks_per_file: int = 12,
+    ) -> list[CodeEvidence]:
+        absolute_path = str((repo_root / source_file.relative_path).resolve())
+        lines = source_file.content.splitlines()
+        if not lines:
+            return []
+
+        try:
+            module = ast.parse(source_file.content, filename=source_file.relative_path)
+        except SyntaxError:
+            return self._chunk_plain_source_file(
+                source_file,
+                repo_root=repo_root,
+                max_chunks_per_file=max_chunks_per_file,
+            )
+
+        chunks: list[CodeEvidence] = []
+        seen_ranges: set[tuple[int, int, str]] = set()
+        top_level_nodes = [
+            node
+            for node in module.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+        ]
+        if top_level_nodes and top_level_nodes[0].lineno > 1:
+            intro_end = min(top_level_nodes[0].lineno - 1, 24)
+            intro_text = "\n".join(lines[:intro_end]).strip()
+            if intro_text:
+                chunks.append(
+                    self._create_code_evidence(
+                        relative_path=source_file.relative_path,
+                        absolute_path=absolute_path,
+                        source_content=source_file.content,
+                        language=source_file.language,
+                        start_line=1,
+                        end_line=intro_end,
+                        code_snippet=intro_text,
+                        symbol_name="module_intro",
+                        parent_symbol="",
+                        block_type="module",
+                        docstring="",
+                    )
+                )
+
+        for node in top_level_nodes:
+            self._append_ast_node_evidence(
+                chunks,
+                seen_ranges,
+                source_file=source_file,
+                absolute_path=absolute_path,
+                node=node,
+                parent_symbol="",
+            )
+            if isinstance(node, ast.ClassDef):
+                for child in node.body:
+                    if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        self._append_ast_node_evidence(
+                            chunks,
+                            seen_ranges,
+                            source_file=source_file,
+                            absolute_path=absolute_path,
+                            node=child,
+                            parent_symbol=node.name,
+                        )
+            if len(chunks) >= max_chunks_per_file:
+                break
+
+        return chunks[:max_chunks_per_file]
+
+    def _append_ast_node_evidence(
+        self,
+        chunks: list[CodeEvidence],
+        seen_ranges: set[tuple[int, int, str]],
+        *,
+        source_file: SourceFile,
+        absolute_path: str,
+        node: ast.AST,
+        parent_symbol: str,
+    ) -> None:
+        start_line = getattr(node, "lineno", 1)
+        end_line = getattr(node, "end_lineno", start_line)
+        if end_line < start_line:
+            end_line = start_line
+
+        block_type = self._infer_block_type(node, parent_symbol=parent_symbol)
+        symbol_name = getattr(node, "name", "") if hasattr(node, "name") else ""
+        if parent_symbol and symbol_name:
+            symbol_name = f"{parent_symbol}.{symbol_name}"
+        range_key = (start_line, end_line, symbol_name or block_type)
+        if range_key in seen_ranges:
+            return
+        seen_ranges.add(range_key)
+
+        snippet = "\n".join(source_file.content.splitlines()[start_line - 1 : end_line]).strip()
+        if not snippet:
+            return
+
+        docstring = ""
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            docstring = ast.get_docstring(node) or ""
+
+        chunks.append(
+            self._create_code_evidence(
+                relative_path=source_file.relative_path,
+                absolute_path=absolute_path,
+                source_content=source_file.content,
+                language=source_file.language,
+                start_line=start_line,
+                end_line=end_line,
+                code_snippet=snippet,
+                symbol_name=symbol_name,
+                parent_symbol=parent_symbol,
+                block_type=block_type,
+                docstring=docstring,
+            )
+        )
+
+    def _chunk_plain_source_file(
+        self,
+        source_file: SourceFile,
+        *,
+        repo_root: Path,
+        max_chunk_lines: int = 48,
+        max_chunks_per_file: int = 8,
+    ) -> list[CodeEvidence]:
+        lines = source_file.content.splitlines()
+        absolute_path = str((repo_root / source_file.relative_path).resolve())
+        chunks: list[CodeEvidence] = []
+        for start_index in range(0, len(lines), max_chunk_lines):
+            start_line = start_index + 1
+            end_line = min(start_index + max_chunk_lines, len(lines))
+            snippet = "\n".join(lines[start_index:end_line]).strip()
+            if not snippet:
+                continue
+            chunks.append(
+                self._create_code_evidence(
+                    relative_path=source_file.relative_path,
+                    absolute_path=absolute_path,
+                    source_content=source_file.content,
+                    language=source_file.language,
+                    start_line=start_line,
+                    end_line=end_line,
+                    code_snippet=snippet,
+                    symbol_name="",
+                    parent_symbol="",
+                    block_type="snippet",
+                    docstring="",
+                )
+            )
+            if len(chunks) >= max_chunks_per_file:
+                break
+        return chunks
+
+    def _create_code_evidence(
+        self,
+        *,
+        relative_path: str,
+        absolute_path: str,
+        source_content: str,
+        language: str,
+        start_line: int,
+        end_line: int,
+        code_snippet: str,
+        symbol_name: str,
+        parent_symbol: str,
+        block_type: str,
+        docstring: str,
+    ) -> CodeEvidence:
+        operator_signals = self._extract_operator_signals(code_snippet)
+        shape_signals = self._extract_shape_signals(code_snippet)
+        raw_symbols = [
+            symbol_name,
+            parent_symbol,
+            *self._extract_defined_symbols(code_snippet),
+            *self._extract_called_symbols(code_snippet),
+            *operator_signals,
+            *shape_signals,
+            *self._extract_symbols(code_snippet),
+        ]
+        symbols = tuple(dict.fromkeys(item for item in raw_symbols if item))
+        return CodeEvidence(
+            file_name=relative_path,
+            code_snippet=code_snippet,
+            related_git_diff="",
+            symbols=symbols,
+            commit_context=(),
+            start_line=start_line,
+            end_line=end_line,
+            language=language,
+            absolute_path=absolute_path,
+            source_content=source_content,
+            symbol_name=symbol_name,
+            parent_symbol=parent_symbol,
+            block_type=block_type,
+            docstring=docstring,
+        )
 
     def _parse_diff_evidences(
         self,
         diff_text: str,
         commit_context: tuple[str, ...],
     ) -> list[CodeEvidence]:
-        """按文件粒度拆 diff。"""
-
         if not diff_text.strip():
             return []
 
@@ -436,8 +791,6 @@ class EvidenceBuilder:
         return evidences
 
     def _build_diff_lookup(self, diff_text: str) -> dict[str, str]:
-        """把 diff 按文件归档，方便代码片段旁边挂关联变更。"""
-
         if not diff_text.strip():
             return {}
 
@@ -459,61 +812,11 @@ class EvidenceBuilder:
                 current_file = PurePosixPath(header_match.group(2)).as_posix()
                 current_lines.append(raw_line)
                 continue
-
             if current_file is not None:
                 current_lines.append(raw_line)
 
         flush_current()
         return diff_lookup
-
-    def _chunk_source_file(
-        self,
-        source_file: SourceFile,
-        *,
-        max_chunk_lines: int = 48,
-        max_chunks_per_file: int = 8,
-    ) -> list[tuple[int, int, str]]:
-        """尽量按函数/类边界切块，让人点章节时右栏看到的是完整语义单元。"""
-
-        lines = source_file.content.splitlines()
-        if not lines:
-            return []
-
-        marker_lines = [
-            index
-            for index, line in enumerate(lines, start=1)
-            if line.lstrip().startswith(("def ", "class ", "async def "))
-        ]
-
-        chunks: list[tuple[int, int, str]] = []
-        if marker_lines and marker_lines[0] > 1:
-            intro_end = min(marker_lines[0] - 1, max_chunk_lines)
-            intro_snippet = "\n".join(lines[:intro_end]).strip()
-            if intro_snippet:
-                chunks.append((1, intro_end, intro_snippet))
-
-        if marker_lines:
-            for index, start_line in enumerate(marker_lines):
-                next_marker = (
-                    marker_lines[index + 1] if index + 1 < len(marker_lines) else len(lines) + 1
-                )
-                end_line = min(next_marker - 1, start_line + max_chunk_lines - 1, len(lines))
-                snippet = "\n".join(lines[start_line - 1 : end_line]).strip()
-                if snippet:
-                    chunks.append((start_line, end_line, snippet))
-                if len(chunks) >= max_chunks_per_file:
-                    break
-            return chunks[:max_chunks_per_file]
-
-        for start_index in range(0, len(lines), max_chunk_lines):
-            start_line = start_index + 1
-            end_line = min(start_index + max_chunk_lines, len(lines))
-            snippet = "\n".join(lines[start_index:end_line]).strip()
-            if snippet:
-                chunks.append((start_line, end_line, snippet))
-            if len(chunks) >= max_chunks_per_file:
-                break
-        return chunks
 
     def _summarize_code_evidence(
         self,
@@ -521,19 +824,19 @@ class EvidenceBuilder:
         *,
         llm_client: LLMClient | None = None,
     ) -> CodeSemanticSummary:
-        """先给代码片段做逻辑摘要，后续 Agent 才能沿调用链继续查。"""
-
         fallback_defined_symbols = tuple(self._extract_defined_symbols(evidence.code_snippet))
         fallback_called_symbols = tuple(self._extract_called_symbols(evidence.code_snippet))
         fallback_anchor_terms = tuple(
             dict.fromkeys(
                 token
                 for token in (
+                    evidence.symbol_name,
+                    evidence.parent_symbol,
                     *evidence.symbols,
                     *fallback_defined_symbols,
                     *fallback_called_symbols,
                 )
-                if len(token) >= 2
+                if token and len(token) >= 2
             )
         )
 
@@ -553,12 +856,7 @@ class EvidenceBuilder:
                 max_tokens=700,
             )
         except RuntimeError:
-            return self._build_fallback_semantic_summary(
-                evidence,
-                defined_symbols=fallback_defined_symbols,
-                called_symbols=fallback_called_symbols,
-                anchor_terms=fallback_anchor_terms,
-            )
+            payload = None
 
         if not isinstance(payload, dict):
             return self._build_fallback_semantic_summary(
@@ -610,8 +908,6 @@ class EvidenceBuilder:
         called_symbols: tuple[str, ...],
         anchor_terms: tuple[str, ...],
     ) -> CodeSemanticSummary:
-        """当模型不可用时，至少保留一个能支持追链路的摘要兜底。"""
-
         summary = self._build_fallback_summary_text(
             evidence,
             defined_symbols=defined_symbols,
@@ -637,12 +933,12 @@ class EvidenceBuilder:
         defined_symbols: tuple[str, ...],
         called_symbols: tuple[str, ...],
     ) -> str:
-        """用结构信息拼一个低配逻辑摘要。"""
-
         summary_parts = [
-            f"{evidence.file_name} 的代码片段",
+            f"{evidence.file_name} 的 {evidence.block_type} 逻辑块",
             f"覆盖 L{evidence.start_line}-L{evidence.end_line}",
         ]
+        if evidence.symbol_name:
+            summary_parts.append(f"核心符号是 {evidence.symbol_name}")
         if defined_symbols:
             summary_parts.append(f"定义了 {', '.join(defined_symbols[:4])}")
         if called_symbols:
@@ -650,27 +946,24 @@ class EvidenceBuilder:
         return "，".join(summary_parts) + "。"
 
     def _build_semantic_summary_system_prompt(self) -> str:
-        """告诉模型如何把代码切片压成后续检索可用的语义摘要。"""
-
         return """
-你是仓库语义索引构建器。
-你的任务是阅读一个代码片段，提炼它在系统中的逻辑职责，方便后续 Agent 做调用链追踪。
-不要重复代码原文，不要泛泛而谈。
+你是仓库语义索引构建器。你的任务是阅读一个代码片段，提炼它在系统中的逻辑职责，
+方便后续 Agent 做调用链追踪。不要重复代码原文，不要泛泛而谈。
 只输出 JSON，字段包括：
 - summary: 中文一句话总结这段代码在做什么
 - responsibilities: 中文短句列表，列出 2-4 个职责
 - defined_symbols: 这段代码显式定义的函数、类或核心变量名列表
-- called_symbols: 这段代码调用或依赖的函数/模块名列表
+- called_symbols: 这段代码调用或依赖的函数 / 模块名列表
 - anchor_terms: 后续检索时可用的机制词、算法词、参数词列表
 """.strip()
 
     def _build_semantic_summary_user_prompt(self, evidence: CodeEvidence) -> str:
-        """为语义索引构建提供上下文。"""
-
         commit_context = "\n".join(evidence.commit_context) if evidence.commit_context else "无"
         return f"""
 【文件】{evidence.file_name}
 【代码范围】L{evidence.start_line}-L{evidence.end_line}
+【逻辑块类型】{evidence.block_type}
+【符号】{evidence.symbol_name or "未命名逻辑块"}
 【代码片段】
 {evidence.code_snippet}
 
@@ -681,14 +974,166 @@ class EvidenceBuilder:
 {commit_context}
 """.strip()
 
-    def _extract_defined_symbols(self, text: str) -> list[str]:
-        """提取定义出来的函数名和类名。"""
+    def _resolve_definition_with_jedi(
+        self,
+        paper_section: PaperSection,
+        code_evidences: tuple[CodeEvidence, ...],
+        *,
+        symbol: str,
+        file_path: str,
+        line: int,
+        column: int,
+        base_evidence: CodeEvidence,
+    ) -> AlignmentCandidate | None:
+        jedi_module = self._load_jedi_module()
+        source_content = base_evidence.source_content
+        actual_column = self._normalize_definition_column(
+            source_content,
+            symbol=symbol,
+            line=line,
+            column=column,
+        )
 
+        try:
+            script = jedi_module.Script(code=source_content, path=base_evidence.absolute_path)
+            definitions = script.goto(
+                line=line,
+                column=actual_column,
+                follow_imports=True,
+                follow_builtin_imports=False,
+            )
+            if not definitions:
+                definitions = script.infer(line=line, column=actual_column)
+        except Exception:  # noqa: BLE001
+            return None
+
+        repo_root = (
+            Path(base_evidence.absolute_path)
+            .resolve()
+            .parents[len(PurePosixPath(file_path).parts) - 1]
+        )
+        for definition in definitions:
+            module_path = getattr(definition, "module_path", None)
+            target_line = getattr(definition, "line", None)
+            if module_path is None or target_line is None:
+                continue
+
+            try:
+                relative_path = Path(module_path).resolve().relative_to(repo_root).as_posix()
+            except ValueError:
+                continue
+
+            target_evidence = self._find_best_evidence(
+                code_evidences,
+                path=relative_path,
+                line_start=target_line,
+                line_end=target_line,
+            )
+            if target_evidence is None:
+                continue
+
+            return AlignmentCandidate(
+                paper_section=paper_section,
+                code_evidence=target_evidence,
+                retrieval_score=max(0.72, min(0.95, target_evidence.start_line / 1000 + 0.72)),
+            )
+        return None
+
+    def _build_definition_observation(
+        self,
+        symbol: str,
+        evidence: CodeEvidence,
+        *,
+        reason: str | None = None,
+    ) -> str:
+        prefix = f"已追踪到 `{symbol}` 的定义"
+        if reason:
+            prefix = f"{reason} 最终命中了 `{symbol}` 的定义"
+        return (
+            f"{prefix}：{evidence.file_name} "
+            f"L{evidence.start_line}-L{evidence.end_line}，"
+            f"逻辑块是 {evidence.symbol_name or evidence.block_type}。"
+        )
+
+    def _find_symbol_candidate_by_name(
+        self,
+        paper_section: PaperSection,
+        code_evidences: tuple[CodeEvidence, ...],
+        *,
+        symbol: str,
+    ) -> AlignmentCandidate | None:
+        normalized = symbol.strip().lower()
+        for evidence in code_evidences:
+            symbol_pool = {item.lower() for item in evidence.symbols if item}
+            symbol_match = evidence.symbol_name.lower() if evidence.symbol_name else ""
+            if normalized == symbol_match or normalized in symbol_pool:
+                return AlignmentCandidate(
+                    paper_section=paper_section,
+                    code_evidence=evidence,
+                    retrieval_score=0.68,
+                )
+        return None
+
+    def _find_best_evidence(
+        self,
+        code_evidences: tuple[CodeEvidence, ...],
+        *,
+        path: str,
+        line_start: int,
+        line_end: int,
+    ) -> CodeEvidence | None:
+        exact_matches = [
+            evidence
+            for evidence in code_evidences
+            if evidence.file_name == path
+            and evidence.start_line <= line_start
+            and evidence.end_line >= line_end
+        ]
+        if exact_matches:
+            return min(exact_matches, key=lambda item: item.end_line - item.start_line)
+
+        for evidence in code_evidences:
+            if evidence.file_name == path:
+                return evidence
+        return None
+
+    def _candidate_id_from_evidence(self, evidence: CodeEvidence) -> str:
+        return f"{evidence.file_name}:{evidence.start_line}-{evidence.end_line}"
+
+    def _load_jedi_module(self):
+        try:
+            jedi_module = import_module("jedi")
+        except ModuleNotFoundError as exc:
+            raise RuntimeError("当前环境缺少 jedi，先安装依赖后再执行跨文件追踪。") from exc
+        cache_dir = Path(".tmp/jedi-cache")
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        if hasattr(jedi_module, "settings"):
+            jedi_module.settings.cache_directory = str(cache_dir.resolve())
+        return jedi_module
+
+    def _normalize_definition_column(
+        self,
+        source_content: str,
+        *,
+        symbol: str,
+        line: int,
+        column: int,
+    ) -> int:
+        lines = source_content.splitlines()
+        if 1 <= line <= len(lines):
+            raw_line = lines[line - 1]
+            if 0 <= column < len(raw_line):
+                return column
+            symbol_index = raw_line.find(symbol)
+            if symbol_index >= 0:
+                return symbol_index
+            return max(0, min(len(raw_line) - 1, column))
+        return 0
+
+    def _extract_defined_symbols(self, text: str) -> list[str]:
         return [symbol for symbol in SYMBOL_DEFINITION_PATTERN.findall(text) if symbol]
 
     def _extract_called_symbols(self, text: str) -> list[str]:
-        """提取潜在调用符号，给二次追踪提供线索。"""
-
         called_symbols: list[str] = []
         for symbol in SYMBOL_CALL_PATTERN.findall(text):
             if symbol in PYTHON_KEYWORDS:
@@ -697,9 +1142,19 @@ class EvidenceBuilder:
                 called_symbols.append(symbol)
         return called_symbols
 
-    def _merge_symbol_lists(self, *groups: tuple[str, ...] | list[str]) -> list[str]:
-        """把多来源符号合并去重。"""
+    def _extract_operator_signals(self, text: str) -> tuple[str, ...]:
+        lowered = text.lower()
+        signals: list[str] = []
+        for name, patterns in OPERATOR_SIGNAL_PATTERNS:
+            if any(pattern in lowered for pattern in patterns):
+                signals.append(name)
+        return tuple(signals)
 
+    def _extract_shape_signals(self, text: str) -> tuple[str, ...]:
+        lowered = text.lower()
+        return tuple(marker for marker in SHAPE_SIGNAL_MARKERS if marker in lowered)
+
+    def _merge_symbol_lists(self, *groups: tuple[str, ...] | list[str]) -> list[str]:
         merged: list[str] = []
         for group in groups:
             for item in group:
@@ -710,11 +1165,8 @@ class EvidenceBuilder:
         return merged
 
     def _normalize_string_list(self, value: object) -> tuple[str, ...]:
-        """把模型返回的列表字段收敛成稳定字符串元组。"""
-
         if not isinstance(value, list):
             return ()
-
         normalized: list[str] = []
         for item in value:
             text = str(item).strip()
@@ -733,12 +1185,9 @@ class EvidenceBuilder:
         order: int,
         paragraph_buffer: list[str],
     ) -> None:
-        """把累计段落落成章节。"""
-
         content = "\n\n".join(item.strip() for item in paragraph_buffer if item.strip()).strip()
         if not content:
             return
-
         sections.append(
             PaperSection(
                 title=title,
@@ -750,8 +1199,6 @@ class EvidenceBuilder:
         )
 
     def _infer_section_level(self, block: PDFBlock) -> int:
-        """根据标题形态推断章节层级。"""
-
         heading_match = HEADING_NUMBER_PATTERN.match(block.text)
         if heading_match:
             return heading_match.group(1).count(".") + 1
@@ -760,18 +1207,12 @@ class EvidenceBuilder:
         return 2 if block.font_size < 16 else 1
 
     def _extract_symbols(self, text: str) -> list[str]:
-        """抽取代码标识符。"""
-
         return [token for token in self._tokenize_text(text) if len(token) >= 2]
 
     def _tokenize_text(self, text: str) -> list[str]:
-        """切词时优先保留标识符和数字，给语义对齐增强策略打底。"""
-
         return [token.lower() for token in IDENTIFIER_PATTERN.findall(text)]
 
     def _build_document_frequencies(self, documents: list[list[str]]) -> Counter[str]:
-        """统计每个词出现在多少个文档里。"""
-
         frequencies: Counter[str] = Counter()
         for document in documents:
             frequencies.update(set(document))
@@ -788,8 +1229,6 @@ class EvidenceBuilder:
         k1: float = 1.5,
         b: float = 0.75,
     ) -> float:
-        """用轻量 BM25 评分召回候选文档。"""
-
         if not query_tokens or not document_tokens:
             return 0.0
 
@@ -809,3 +1248,10 @@ class EvidenceBuilder:
             denominator = frequency + k1 * (1 - b + b * (document_len / max(avg_doc_len, 1.0)))
             score += idf * (numerator / denominator)
         return score
+
+    def _infer_block_type(self, node: ast.AST, *, parent_symbol: str) -> str:
+        if isinstance(node, ast.ClassDef):
+            return "class"
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            return "method" if parent_symbol else "function"
+        return "snippet"

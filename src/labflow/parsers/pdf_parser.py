@@ -291,7 +291,27 @@ class PDFParser:
             line_text = "".join(span.get("text", "") for span in spans).strip()
             if line_text:
                 text_parts.append(line_text)
-        return "\n".join(text_parts).strip()
+        return self._normalize_block_lines(text_parts)
+
+    def _normalize_block_lines(self, text_parts: list[str]) -> str:
+        """把 PDF 按行抽出的碎文本重新拼回更接近自然段的样子。"""
+
+        if not text_parts:
+            return ""
+
+        merged_lines: list[str] = [text_parts[0]]
+        for current_line in text_parts[1:]:
+            previous_line = merged_lines[-1]
+            if previous_line.endswith("-") and current_line[:1].islower():
+                merged_lines[-1] = previous_line[:-1] + current_line
+                continue
+            if previous_line.endswith((".", "!", "?", ":", ";")):
+                merged_lines.append(current_line)
+                continue
+            merged_lines[-1] = f"{previous_line} {current_line}".strip()
+
+        normalized = " ".join(item.strip() for item in merged_lines if item.strip())
+        return " ".join(normalized.split())
 
     def _extract_font_size(self, block: dict) -> float:
         """提取文本块平均字号。"""

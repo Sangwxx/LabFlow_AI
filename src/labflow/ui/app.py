@@ -17,6 +17,7 @@ from labflow.ui.pdf_viewer import render_pdf_viewer
 from labflow.ui.sidebar import SidebarState, render_sidebar
 
 EVIDENCE_BUILDER = EvidenceBuilder()
+ALIGNMENT_CACHE_VERSION = "learning-output-v5"
 
 
 @dataclass(frozen=True)
@@ -58,7 +59,7 @@ def init_session_state() -> None:
     st.session_state.setdefault("landing_git_repo_path", "")
     st.session_state.setdefault("workspace_signature", None)
     st.session_state.setdefault("workspace_data", None)
-    st.session_state.setdefault("selected_section_index", 0)
+    st.session_state.setdefault("selected_section_index", None)
     st.session_state.setdefault("pdf_hotspot_viewer", None)
     st.session_state.setdefault("semantic_alignment_cache", {})
 
@@ -125,7 +126,8 @@ def render_landing() -> None:
                 st.warning("先填写本地代码路径，再进入工作区。")
                 return
             st.session_state["current_route"] = "workspace"
-            st.session_state["selected_section_index"] = 0
+            st.session_state["selected_section_index"] = None
+            st.session_state["pdf_hotspot_viewer"] = None
             st.rerun()
 
 
@@ -240,11 +242,13 @@ def build_workspace_signature(
 
 def sync_section_selection(workspace: WorkspaceState) -> None:
     if not workspace.focus_sections:
-        st.session_state["selected_section_index"] = 0
+        st.session_state["selected_section_index"] = None
         return
-    current_index = st.session_state.get("selected_section_index", 0)
+    current_index = st.session_state.get("selected_section_index")
+    if current_index is None:
+        return
     if current_index >= len(workspace.focus_sections):
-        st.session_state["selected_section_index"] = 0
+        st.session_state["selected_section_index"] = None
 
 
 @st.cache_data(show_spinner=False)
@@ -279,9 +283,8 @@ def render_pdf_panel(workspace: WorkspaceState) -> PaperSection | None:
             st.caption("请先执行 `python -m pip install pymupdf`，然后刷新页面。")
 
     sync_hotspot_selection(workspace)
-    selected_section = render_section_picker(workspace.focus_sections)
-    if selected_section is not None:
-        st.caption(f"P{selected_section.page_number} · {selected_section.title}")
+    selected_section = get_selected_section(workspace.focus_sections)
+    render_section_focus_bar(selected_section)
 
     if workspace.pdf_bytes is not None:
         try:
@@ -298,21 +301,32 @@ def render_pdf_panel(workspace: WorkspaceState) -> PaperSection | None:
     return selected_section
 
 
-def render_section_picker(paper_sections: tuple[PaperSection, ...]) -> PaperSection | None:
+def get_selected_section(paper_sections: tuple[PaperSection, ...]) -> PaperSection | None:
     if not paper_sections:
         st.info("当前 PDF 还没有抽取出可点击的章节。")
         return None
 
-    selected_index = st.selectbox(
-        "章节定位",
-        options=tuple(range(len(paper_sections))),
-        index=min(st.session_state.get("selected_section_index", 0), len(paper_sections) - 1),
-        format_func=lambda index: format_section_label(paper_sections[index]),
-        key="section_picker",
-        label_visibility="collapsed",
+    current_index = st.session_state.get("selected_section_index")
+    if not isinstance(current_index, int):
+        return None
+    if not 0 <= current_index < len(paper_sections):
+        return None
+    return paper_sections[current_index]
+
+
+def render_section_focus_bar(section: PaperSection | None) -> None:
+    if section is None:
+        st.caption("点击左侧论文中的段落后，这里会显示当前聚焦片段。")
+        return
+    st.markdown(
+        (
+            '<div class="section-focus-bar">'
+            f'<span class="section-focus-page">P{section.page_number}</span>'
+            f'<span class="section-focus-title">{section.title}</span>'
+            "</div>"
+        ),
+        unsafe_allow_html=True,
     )
-    st.session_state["selected_section_index"] = selected_index
-    return paper_sections[selected_index]
 
 
 def format_section_label(section: PaperSection) -> str:
@@ -346,7 +360,7 @@ def render_code_panel(workspace: WorkspaceState, selected_section: PaperSection 
         st.info("先准备代码目录，右侧才会显示对应代码。")
         return
     if selected_section is None:
-        st.info("先在左侧选择一个章节。")
+        st.info("请选择论文片段开始深度对齐。")
         return
 
     trace_events: list[dict] = []
@@ -386,7 +400,7 @@ def get_semantic_alignment(
     project_structure: str,
     event_handler=None,
 ) -> AlignmentResult | None:
-    cache_key = f"{workspace_signature}:{selected_section.order}"
+    cache_key = f"{ALIGNMENT_CACHE_VERSION}:{workspace_signature}:{selected_section.order}"
     cached_result = st.session_state["semantic_alignment_cache"].get(cache_key)
     if cached_result is not None:
         if event_handler is not None:
@@ -405,16 +419,11 @@ def get_semantic_alignment(
 
 
 def render_trace_panel(placeholder, trace_events: list[dict], *, finalized: bool) -> None:
-    with placeholder.container():
-        if not trace_events:
-            return
-        if finalized:
-            with st.expander("查看推理链路", expanded=False):
-                with st.container(height=300):
-                    for event in trace_events:
-                        render_trace_event(event)
-            return
+    if not trace_events or finalized:
+        placeholder.empty()
+        return
 
+    with placeholder.container():
         with st.container(height=300):
             status = st.status("Agent 正在推理...", expanded=True)
             for event in trace_events:
@@ -450,50 +459,33 @@ def render_trace_event(event: dict, status=None) -> None:
 
 
 def render_code_canvas(alignment_result: AlignmentResult) -> None:
-    verdict_label = {
-        "strong_match": "强语义对齐",
-        "partial_match": "局部实现",
-        "missing_implementation": "未见本地实现",
-        "formula_mismatch": "实现偏离论文",
-    }.get(alignment_result.match_type, "语义判断")
+    st.markdown("### 【中文译文】")
+    st.markdown(alignment_result.analysis)
 
-    header_parts = [f"{verdict_label} {alignment_result.score_out_of_ten:.1f}/10"]
-    if alignment_result.code_file_name:
-        header_parts.append(alignment_result.code_file_name)
-    if alignment_result.code_start_line <= alignment_result.code_end_line:
-        header_parts.append(
+    st.markdown("### 【核心要点】")
+    st.markdown(alignment_result.semantic_evidence or "当前暂无重点提炼。")
+
+    st.markdown("### 【术语百科】")
+    st.markdown(alignment_result.research_supplement or "这一段没有特别需要额外展开的术语。")
+
+    if should_render_source_grounding(alignment_result):
+        st.markdown("### 【源码落地】")
+        st.caption(
+            f"{alignment_result.code_file_name} · "
             f"L{alignment_result.code_start_line}-L{alignment_result.code_end_line}"
         )
-    st.info(" · ".join(header_parts))
+        st.markdown(alignment_result.implementation_chain)
+        with st.container(height=1120):
+            st.markdown(build_highlighted_code_html(alignment_result), unsafe_allow_html=True)
 
-    if alignment_result.confidence_note:
-        if alignment_result.needs_manual_review:
-            st.warning(alignment_result.confidence_note)
-        else:
-            st.info(alignment_result.confidence_note)
 
-    st.markdown("### 逻辑对齐")
-    st.markdown(alignment_result.implementation_chain or alignment_result.analysis)
-
-    st.markdown("### 科研补完")
-    st.markdown(alignment_result.research_supplement or "当前暂无额外科研补完说明。")
-
-    if alignment_result.reflection:
-        st.markdown("### 自我审计")
-        st.markdown(alignment_result.reflection)
-
-    if alignment_result.step_traces:
-        with st.expander("查看详细执行轨迹", expanded=False):
-            for trace in alignment_result.step_traces:
-                st.markdown(f"**[Current Plan]** {trace.step.display_text}")
-                st.markdown(f"**[Thought]** {trace.thought}")
-                st.markdown(f"**[Action]** {trace.action}")
-                st.markdown(f"**[Observation]** {trace.observation}")
-                for invocation in trace.tool_invocations:
-                    st.markdown(f"- `{invocation.tool_name}` | 输入: `{invocation.tool_input}`")
-
-    with st.container(height=1120):
-        st.markdown(build_highlighted_code_html(alignment_result), unsafe_allow_html=True)
+def should_render_source_grounding(alignment_result: AlignmentResult) -> bool:
+    return (
+        alignment_result.match_type == "strong_match"
+        and alignment_result.alignment_score >= 0.78
+        and bool(alignment_result.implementation_chain.strip())
+        and not alignment_result.code_snippet.startswith("# 当前未定位到对应源码")
+    )
 
 
 def build_highlighted_code_html(alignment_result: AlignmentResult) -> str:
@@ -617,6 +609,35 @@ def inject_styles() -> None:
                 font-size: 2.4rem;
                 font-weight: 700;
                 color: #1a2b3d;
+            }
+
+            .section-focus-bar {
+                display: flex;
+                align-items: center;
+                gap: 0.75rem;
+                min-height: 3.25rem;
+                padding: 0.75rem 0.95rem;
+                margin: 0 0 0.65rem 0;
+                border-radius: 18px;
+                background: rgba(239, 241, 246, 0.92);
+                border: 1px solid rgba(34, 47, 62, 0.08);
+            }
+
+            .section-focus-page {
+                flex: 0 0 auto;
+                padding: 0.2rem 0.6rem;
+                border-radius: 999px;
+                background: rgba(31, 43, 61, 0.08);
+                color: #1a2b3d;
+                font-weight: 600;
+                font-size: 0.92rem;
+            }
+
+            .section-focus-title {
+                color: #2f4052;
+                font-size: 1rem;
+                font-weight: 500;
+                line-height: 1.4;
             }
 
             .semantic-code-shell {
