@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import json
+import re
 from collections.abc import Callable
 from dataclasses import replace
 
@@ -531,6 +532,7 @@ class PlanAndExecuteAgent:
                     paper_section,
                     role_prompt=role_prompt,
                     mode_note="当前片段被预审为学术导读内容，未启动代码深度对齐。",
+                    event_handler=event_handler,
                 ),
                 paper_section,
             )
@@ -998,47 +1000,67 @@ class PlanAndExecuteAgent:
         *,
         role_prompt: str,
         mode_note: str,
+        event_handler: AgentEventHandler | None = None,
     ) -> AlignmentResult:
-        payload = self._llm_client.generate_json(
-            system_prompt="\n".join(
-                [
-                    role_prompt,
-                    "你当前处于学术导读模式。",
-                    "请严格按照 科研学习助手 的语气输出。",
-                    "【中文译文】必须且只能包含原段落的中文翻译。",
-                    "【核心要点】必须输出 3 条中文要点，不能讨论没找到代码。",
-                    "【术语百科】必须解释 2 到 3 个专业英文术语，语言要通俗。",
-                    "严禁提代码对齐失败、证据不足、自我审计等内部状态。",
-                    "如果片段本身偏标题、摘要或引言，就专心讲清研究背景和核心思想。",
-                    (
-                        "只输出 JSON，格式为 "
-                        '{"analysis": "...", "semantic_evidence": "...", '
-                        '"research_supplement": "...", "improvement_suggestion": "..."}。'
-                    ),
-                ]
-            ),
-            user_prompt=f"【论文片段】{paper_section.combined_text}",
-            temperature=0.1,
-            max_tokens=900,
+        self._emit(
+            event_handler,
+            kind="action",
+            message="translate_section",
+            action_input={"mode": "academic_guide"},
         )
-        analysis = self._build_translation_fallback(paper_section)
-        semantic_evidence = self._build_core_points_fallback(paper_section)
-        research_supplement = self._build_term_glossary(paper_section)
+        self._emit(
+            event_handler,
+            kind="thought",
+            message="我先把当前片段完整翻成中文，确保后面的要点提炼建立在稳定译文上。",
+        )
+        analysis = self._generate_learning_translation(paper_section)
+        self._emit(
+            event_handler,
+            kind="observation",
+            message="中文译文阶段完成。",
+        )
+        self._emit(
+            event_handler,
+            kind="action",
+            message="summarize_key_points",
+            action_input={"mode": "academic_guide"},
+        )
+        self._emit(
+            event_handler,
+            kind="thought",
+            message="译文已经拿到，我现在只提炼学术重点，不讨论代码映射。",
+        )
+        semantic_evidence = self._generate_learning_core_points(
+            paper_section,
+            translation=analysis,
+        )
+        self._emit(
+            event_handler,
+            kind="observation",
+            message="核心要点提炼完成。",
+        )
+        self._emit(
+            event_handler,
+            kind="action",
+            message="build_glossary",
+            action_input={"mode": "academic_guide"},
+        )
+        self._emit(
+            event_handler,
+            kind="thought",
+            message="接下来补术语百科，把片段里最关键的专门概念讲清楚。",
+        )
+        research_supplement = self._generate_learning_glossary(
+            paper_section,
+            translation=analysis,
+            core_points=semantic_evidence,
+        )
+        self._emit(
+            event_handler,
+            kind="observation",
+            message="术语百科整理完成。",
+        )
         improvement_suggestion = "建议先读懂该段的研究动机，再跳到方法或实现章节进行代码深度对齐。"
-        if isinstance(payload, dict):
-            analysis = str(payload.get("analysis", analysis)).strip() or analysis
-            semantic_evidence = (
-                str(payload.get("semantic_evidence", semantic_evidence)).strip()
-                or semantic_evidence
-            )
-            research_supplement = (
-                str(payload.get("research_supplement", research_supplement)).strip()
-                or research_supplement
-            )
-            improvement_suggestion = (
-                str(payload.get("improvement_suggestion", improvement_suggestion)).strip()
-                or improvement_suggestion
-            )
 
         return AlignmentResult(
             paper_section_title=paper_section.title,
@@ -1078,19 +1100,25 @@ class PlanAndExecuteAgent:
         paper_section: PaperSection,
     ) -> AlignmentResult:
         analysis = self._normalize_translation_text(result.analysis, paper_section)
+        analysis = self._ensure_chinese_translation(paper_section, analysis)
         semantic_evidence = self._normalize_core_points_text(
             result.semantic_evidence,
             paper_section,
+        )
+        semantic_evidence = self._ensure_learning_core_points(
+            paper_section,
+            semantic_evidence,
+            translation=analysis,
         )
         research_supplement = self._normalize_glossary_text(
             result.research_supplement,
             paper_section,
         )
-        analysis, semantic_evidence, research_supplement = self._repair_learning_sections_if_needed(
+        research_supplement = self._ensure_learning_glossary(
             paper_section,
-            analysis,
-            semantic_evidence,
             research_supplement,
+            translation=analysis,
+            core_points=semantic_evidence,
         )
         return replace(
             result,
@@ -1099,6 +1127,242 @@ class PlanAndExecuteAgent:
             research_supplement=research_supplement,
         )
 
+    def _generate_learning_translation(self, paper_section: PaperSection) -> str:
+        return self._ensure_chinese_translation(paper_section, "")
+
+    def _ensure_chinese_translation(self, paper_section: PaperSection, text: str) -> str:
+        if (
+            text
+            and not self._is_english_heavy(text)
+            and not self._looks_like_empty_learning_text(text)
+        ):
+            return text
+
+        payload = self._llm_client.generate_json(
+            system_prompt="\n".join(
+                [
+                    "你是一个学术翻译助手。",
+                    "你的任务只有一个：把给定论文片段完整翻译成自然、准确的中文。",
+                    "不要总结，不要解释，不要输出术语百科，不要讨论代码。",
+                    '只输出 JSON，格式为 {"translation": "..."}。',
+                ]
+            ),
+            user_prompt=f"【待翻译论文片段】{paper_section.content}",
+            temperature=0.0,
+            max_tokens=1200,
+        )
+        if isinstance(payload, dict):
+            translated = str(payload.get("translation", "")).strip()
+            if self._is_acceptable_translation(translated, paper_section.content):
+                return translated
+
+        generate_text = getattr(self._llm_client, "generate_text", None)
+        if callable(generate_text):
+            translated_text = generate_text(
+                system_prompt="\n".join(
+                    [
+                        "你是一个学术翻译助手。",
+                        "请把给定论文片段完整翻译成自然、准确、流畅的中文。",
+                        "不要总结，不要解释，不要补充背景，不要讨论代码。",
+                        "只输出中文译文正文。",
+                    ]
+                ),
+                user_prompt=f"【待翻译论文片段】{paper_section.content}",
+                temperature=0.0,
+                max_tokens=1400,
+            )
+            translated_text = translated_text.strip()
+            if self._is_acceptable_translation(translated_text, paper_section.content):
+                return translated_text
+
+            segmented_translation = self._translate_in_segments(
+                paper_section.content,
+                generate_text,
+            )
+            if segmented_translation:
+                return segmented_translation
+
+        return self._build_translation_fallback(paper_section)
+
+    def _translate_in_segments(
+        self,
+        content: str,
+        generate_text: Callable[..., str],
+    ) -> str:
+        segments = self._split_translation_segments(content)
+        if len(segments) <= 1:
+            return ""
+
+        translated_segments: list[str] = []
+        for segment in segments:
+            translated = generate_text(
+                system_prompt="\n".join(
+                    [
+                        "你是一个学术翻译助手。",
+                        "请把给定英文片段准确翻译成自然、流畅的中文。",
+                        "不要总结，不要解释，只输出中文译文。",
+                    ]
+                ),
+                user_prompt=f"【待翻译片段】{segment}",
+                temperature=0.0,
+                max_tokens=500,
+            ).strip()
+            if not self._is_acceptable_translation(translated, segment):
+                return ""
+            translated_segments.append(translated)
+
+        return "\n".join(translated_segments).strip()
+
+    def _split_translation_segments(self, content: str) -> tuple[str, ...]:
+        normalized = " ".join(content.replace("\n", " ").split()).strip()
+        if not normalized:
+            return ()
+
+        parts = re.split(r"(?<=[.!?;:])\s+", normalized)
+        simple_parts = tuple(part.strip() for part in parts if part.strip())
+        if len(simple_parts) > 1:
+            return simple_parts
+
+        segments: list[str] = []
+        current = ""
+        for part in parts:
+            part = part.strip()
+            if not part:
+                continue
+            candidate = f"{current} {part}".strip() if current else part
+            if len(candidate) <= 220:
+                current = candidate
+                continue
+            if current:
+                segments.append(current)
+            current = part
+        if current:
+            segments.append(current)
+        return tuple(segments)
+
+    def _is_acceptable_translation(self, translated_text: str, source_text: str) -> bool:
+        cleaned = translated_text.strip()
+        if self._looks_like_empty_learning_text(cleaned):
+            return False
+
+        chinese_chars = sum("\u4e00" <= char <= "\u9fff" for char in cleaned)
+        ascii_letters = sum(char.isascii() and char.isalpha() for char in cleaned)
+        normalized_source = " ".join(source_text.split()).strip().lower()
+        normalized_translated = " ".join(cleaned.split()).strip().lower()
+
+        if normalized_source and normalized_translated == normalized_source:
+            return False
+        if chinese_chars >= 20:
+            return True
+        if chinese_chars >= 8 and chinese_chars >= ascii_letters:
+            return True
+        return not self._is_english_heavy(cleaned)
+
+    def _generate_learning_core_points(
+        self,
+        paper_section: PaperSection,
+        *,
+        translation: str,
+    ) -> str:
+        return self._ensure_learning_core_points(
+            paper_section,
+            "",
+            translation=translation,
+        )
+
+    def _ensure_learning_core_points(
+        self,
+        paper_section: PaperSection,
+        text: str,
+        *,
+        translation: str,
+    ) -> str:
+        normalized = self._normalize_core_points_text(text, paper_section)
+        if text.strip() and normalized.count("- ") >= 3:
+            return normalized
+
+        payload = self._llm_client.generate_json(
+            system_prompt="\n".join(
+                [
+                    "你是一个耐心的科研学习助手。",
+                    "你的任务只有一个：提炼论文片段的 3 条核心要点。",
+                    "输出必须是中文列表，每条都要讲清这段话在解决什么问题或提出什么关键思想。",
+                    "不要讨论代码，不要解释为什么没有匹配到代码，不要输出 JSON 以外的多余文字。",
+                    '只输出 JSON，格式为 {"semantic_evidence": ["...", "...", "..."]}。',
+                ]
+            ),
+            user_prompt=(f"【论文片段原文】{paper_section.content}\n\n【中文译文】{translation}"),
+            temperature=0.1,
+            max_tokens=900,
+        )
+        if isinstance(payload, dict):
+            candidate = payload.get("semantic_evidence", "")
+            if isinstance(candidate, list):
+                items = [str(item).strip() for item in candidate if str(item).strip()]
+                if len(items) >= 3:
+                    return self._format_bullets(items[:3])
+            repaired = self._normalize_core_points_text(str(candidate), paper_section)
+            if repaired.count("- ") >= 3:
+                return repaired
+
+        return self._build_core_points_fallback(paper_section)
+
+    def _generate_learning_glossary(
+        self,
+        paper_section: PaperSection,
+        *,
+        translation: str,
+        core_points: str,
+    ) -> str:
+        return self._ensure_learning_glossary(
+            paper_section,
+            "",
+            translation=translation,
+            core_points=core_points,
+        )
+
+    def _ensure_learning_glossary(
+        self,
+        paper_section: PaperSection,
+        text: str,
+        *,
+        translation: str,
+        core_points: str,
+    ) -> str:
+        normalized = self._normalize_glossary_text(text, paper_section)
+        if text.strip() and normalized.count("- ") >= 2:
+            return normalized
+
+        payload = self._llm_client.generate_json(
+            system_prompt="\n".join(
+                [
+                    "你是一个耐心的科研学习助手。",
+                    "你的任务只有一个：解释论文片段中的 2 到 3 个关键专业术语。",
+                    "输出必须是中文列表，每条都要先写术语，再做通俗解释。",
+                    "不要讨论代码，不要输出实现链路，不要解释内部推理状态。",
+                    '只输出 JSON，格式为 {"research_supplement": ["...", "..."]}。',
+                ]
+            ),
+            user_prompt=(
+                f"【论文片段原文】{paper_section.content}\n\n"
+                f"【中文译文】{translation}\n\n"
+                f"【核心要点】{core_points}"
+            ),
+            temperature=0.1,
+            max_tokens=900,
+        )
+        if isinstance(payload, dict):
+            candidate = payload.get("research_supplement", "")
+            if isinstance(candidate, list):
+                items = [str(item).strip() for item in candidate if str(item).strip()]
+                if len(items) >= 2:
+                    return self._format_bullets(items[:3])
+            repaired = self._normalize_glossary_text(str(candidate), paper_section)
+            if repaired.count("- ") >= 2:
+                return repaired
+
+        return self._build_term_glossary(paper_section)
+
     def _normalize_translation_text(self, raw_text: str, paper_section: PaperSection) -> str:
         parsed = self._try_parse_structured_text(raw_text)
         if isinstance(parsed, dict):
@@ -1106,10 +1370,12 @@ class PlanAndExecuteAgent:
                 value = parsed.get(key)
                 if isinstance(value, str) and value.strip():
                     return value.strip()
-            return self._build_translation_fallback(paper_section)
+            return ""
         cleaned = raw_text.strip()
         if not cleaned or cleaned.startswith("{") or cleaned.startswith("["):
-            return self._build_translation_fallback(paper_section)
+            return ""
+        if self._looks_like_empty_learning_text(cleaned):
+            return ""
         return cleaned
 
     def _normalize_core_points_text(self, raw_text: str, paper_section: PaperSection) -> str:
@@ -1183,73 +1449,20 @@ class PlanAndExecuteAgent:
     def _format_bullets(self, items: list[str]) -> str:
         return "\n".join(f"- {item}" for item in items if item)
 
-    def _repair_learning_sections_if_needed(
-        self,
-        paper_section: PaperSection,
-        analysis: str,
-        semantic_evidence: str,
-        research_supplement: str,
-    ) -> tuple[str, str, str]:
-        if not self._needs_learning_repair(analysis, semantic_evidence, research_supplement):
-            return analysis, semantic_evidence, research_supplement
-
-        payload = self._llm_client.generate_json(
-            system_prompt="\n".join(
-                [
-                    "你是一个耐心、专业的科研学习助手。",
-                    "请把论文片段整理成三个模块。",
-                    "【中文译文】必须是完整、自然、准确的中文翻译，不能省略，不能夹带代码说明。",
-                    "【核心要点】必须是 3 条中文要点列表，只讲知识点。",
-                    "【术语百科】必须是 2 到 3 条中文术语解释，挑选真正重要的英文术语。",
-                    (
-                        "只输出 JSON，格式为 "
-                        '{"analysis": "...", "semantic_evidence": "...", '
-                        '"research_supplement": "..."}。'
-                    ),
-                ]
-            ),
-            user_prompt=f"【论文片段】{paper_section.combined_text}",
-            temperature=0.1,
-            max_tokens=1200,
-        )
-        if not isinstance(payload, dict):
-            return analysis, semantic_evidence, research_supplement
-
-        repaired_analysis = self._normalize_translation_text(
-            str(payload.get("analysis", analysis)),
-            paper_section,
-        )
-        repaired_core = self._normalize_core_points_text(
-            str(payload.get("semantic_evidence", semantic_evidence)),
-            paper_section,
-        )
-        repaired_glossary = self._normalize_glossary_text(
-            str(payload.get("research_supplement", research_supplement)),
-            paper_section,
-        )
-        return repaired_analysis, repaired_core, repaired_glossary
-
-    def _needs_learning_repair(
-        self,
-        analysis: str,
-        semantic_evidence: str,
-        research_supplement: str,
-    ) -> bool:
-        if self._looks_like_structured_blob(analysis) or self._looks_like_structured_blob(
-            research_supplement
-        ):
+    def _looks_like_empty_learning_text(self, text: str) -> bool:
+        cleaned = text.strip()
+        if not cleaned:
             return True
-        if self._is_english_heavy(analysis):
+        punctuation_only = cleaned.strip(":：-·•,，.。;；!?！？[]{}()（）")
+        if not punctuation_only:
             return True
-        if semantic_evidence.count("- ") < 3:
+        chinese_chars = sum("\u4e00" <= char <= "\u9fff" for char in cleaned)
+        ascii_letters = sum(char.isascii() and char.isalpha() for char in cleaned)
+        if len(cleaned) <= 4:
             return True
-        if research_supplement.count("- ") < 2:
+        if chinese_chars == 0 and ascii_letters <= 4:
             return True
         return False
-
-    def _looks_like_structured_blob(self, text: str) -> bool:
-        cleaned = text.strip()
-        return cleaned.startswith("{") or cleaned.startswith("[")
 
     def _is_english_heavy(self, text: str) -> bool:
         latin_chars = sum(char.isascii() and char.isalpha() for char in text)
@@ -1258,7 +1471,12 @@ class PlanAndExecuteAgent:
 
     def _build_translation_fallback(self, paper_section: PaperSection) -> str:
         summary = " ".join(paper_section.content.replace("\n", " ").split()).strip()
-        return summary
+        if not summary:
+            return "当前片段未提取到可供翻译的正文内容。"
+        return (
+            "当前模型这一轮没有稳定产出完整中文译文。"
+            "建议重新点击该段重试；如果连续两次都出现这个情况，我会继续把翻译链单独拆出来。"
+        )
 
     def _build_core_points_fallback(self, paper_section: PaperSection) -> str:
         title = paper_section.title.strip() or "当前片段"

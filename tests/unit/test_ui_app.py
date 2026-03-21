@@ -4,6 +4,7 @@ from labflow.reasoning.models import AlignmentResult, PaperSection
 from labflow.ui.app import (
     build_highlighted_code_html,
     get_selected_section,
+    resolve_focus_section_index,
     should_render_source_grounding,
 )
 
@@ -60,6 +61,33 @@ def test_get_selected_section_supports_initial_silent_state() -> None:
     )
 
     assert get_selected_section(sections) is None
+
+
+def test_resolve_focus_section_index_supports_merged_block_orders() -> None:
+    """合并后的自然段应该允许我点击其中任意一个原始块。"""
+
+    sections = (
+        PaperSection(
+            title="Abstract",
+            content="Following language instructions to navigate in unseen environments.",
+            level=1,
+            page_number=1,
+            order=1,
+            block_orders=(1, 2, 3),
+        ),
+        PaperSection(
+            title="3 Method",
+            content="We build a dual-scale graph encoder.",
+            level=1,
+            page_number=3,
+            order=4,
+            block_orders=(4,),
+        ),
+    )
+
+    assert resolve_focus_section_index(sections, 2) == 0
+    assert resolve_focus_section_index(sections, 4) == 1
+    assert resolve_focus_section_index(sections, 99) is None
 
 
 def test_source_grounding_only_shows_for_strong_alignment() -> None:

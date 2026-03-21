@@ -163,20 +163,98 @@ class EvidenceBuilder:
                 level=current_level,
                 page_number=first_block.page_number,
                 order=first_block.order,
+                block_orders=tuple(block.order for block in paragraph_blocks),
             )
         )
 
     def _should_merge_focus_block(self, previous_block: PDFBlock, current_block: PDFBlock) -> bool:
+        if self._is_same_page_same_column_continuation(previous_block, current_block):
+            return True
+        if self._is_cross_column_continuation(previous_block, current_block):
+            return True
+        if self._is_cross_page_continuation(previous_block, current_block):
+            return True
+        return False
+
+    def _is_same_page_same_column_continuation(
+        self, previous_block: PDFBlock, current_block: PDFBlock
+    ) -> bool:
         if previous_block.page_number != current_block.page_number:
             return False
         previous_gap = current_block.bbox[1] - previous_block.bbox[3]
         max_gap = max(previous_block.font_size, current_block.font_size) * 1.8
-        left_offset = abs(current_block.bbox[0] - previous_block.bbox[0])
         if previous_gap > max_gap:
             return False
-        if left_offset > max(previous_block.font_size, current_block.font_size) * 2.5:
+        if not self._is_same_column(previous_block, current_block):
             return False
         return True
+
+    def _is_cross_page_continuation(
+        self, previous_block: PDFBlock, current_block: PDFBlock
+    ) -> bool:
+        if current_block.page_number - previous_block.page_number != 1:
+            return False
+        if not self._is_same_column(previous_block, current_block):
+            return False
+        if not self._looks_like_continuation(previous_block.text, current_block.text):
+            return False
+        if previous_block.page_height <= 0 or current_block.page_height <= 0:
+            return False
+        previous_bottom_ratio = previous_block.bbox[3] / previous_block.page_height
+        current_top_ratio = current_block.bbox[1] / current_block.page_height
+        if previous_bottom_ratio < 0.72:
+            return False
+        if current_top_ratio > 0.2:
+            return False
+        if not self._is_similar_block_width(previous_block, current_block):
+            return False
+        return True
+
+    def _is_cross_column_continuation(
+        self, previous_block: PDFBlock, current_block: PDFBlock
+    ) -> bool:
+        if previous_block.page_number != current_block.page_number:
+            return False
+        if self._is_same_column(previous_block, current_block):
+            return False
+        if not self._looks_like_continuation(previous_block.text, current_block.text):
+            return False
+        if previous_block.page_width <= 0 or current_block.page_width <= 0:
+            return False
+        previous_bottom_ratio = previous_block.bbox[3] / previous_block.page_height
+        current_top_ratio = current_block.bbox[1] / current_block.page_height
+        left_shift = current_block.bbox[0] - previous_block.bbox[0]
+        if left_shift < previous_block.page_width * 0.12:
+            return False
+        if previous_bottom_ratio < 0.55:
+            return False
+        if current_top_ratio > 0.32:
+            return False
+        if not self._is_similar_block_width(previous_block, current_block):
+            return False
+        return True
+
+    def _is_same_column(self, previous_block: PDFBlock, current_block: PDFBlock) -> bool:
+        left_offset = abs(current_block.bbox[0] - previous_block.bbox[0])
+        return left_offset <= max(previous_block.font_size, current_block.font_size) * 2.5
+
+    def _is_similar_block_width(self, previous_block: PDFBlock, current_block: PDFBlock) -> bool:
+        previous_width = max(previous_block.bbox[2] - previous_block.bbox[0], 1.0)
+        current_width = max(current_block.bbox[2] - current_block.bbox[0], 1.0)
+        width_ratio = min(previous_width, current_width) / max(previous_width, current_width)
+        return width_ratio >= 0.72
+
+    def _looks_like_continuation(self, previous_text: str, current_text: str) -> bool:
+        previous_tail = previous_text.rstrip()
+        current_head = current_text.lstrip()
+        if not previous_tail or not current_head:
+            return False
+        if previous_tail.endswith("-"):
+            return True
+        if previous_tail[-1] not in ".!?;:。！？；：":
+            return True
+        first_char = current_head[0]
+        return first_char.islower() or first_char.isdigit()
 
     def build_paper_sections(self, pdf_result: PDFParseResult) -> tuple[PaperSection, ...]:
         sections: list[PaperSection] = []

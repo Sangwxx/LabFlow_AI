@@ -29,6 +29,7 @@ class PaperSection:
     level: int
     page_number: int
     order: int
+    block_orders: tuple[int, ...] = ()
 
     @property
     def combined_text(self) -> str:

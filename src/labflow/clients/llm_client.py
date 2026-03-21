@@ -10,7 +10,7 @@ from importlib import import_module
 from labflow.config.settings import get_settings
 
 REACT_AGENT_ROLE_PROMPT = (
-    "你是一个精通 PyTorch 和 Vision-Language Navigation 的源码审计专家。"
+    "你是一个精通 PyTorch 的源码审计专家。"
     "你不是一个编译器，你是一个导师。"
     "你的任务是根据用户选中的论文片段，利用 list_files 和 read_code 工具在代码库中寻找实现证据。"
     "你的回答必须侧重理论与实践的结合。"
@@ -72,6 +72,36 @@ class LLMClient:
                 return None
         return None
 
+    def generate_text(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        temperature: float = 0.0,
+        max_tokens: int = 1200,
+    ) -> str:
+        """请求模型返回纯文本，供长段落翻译等不适合强行 JSON 化的场景使用。"""
+
+        for attempt in range(3):
+            try:
+                response = self._client.chat.completions.create(
+                    model=self._settings.model_name,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                )
+                content = response.choices[0].message.content or ""
+                return self._clean_text_response(content)
+            except Exception as exc:  # noqa: BLE001
+                if self._is_rate_limit_error(exc) and attempt < 2:
+                    time.sleep(1.2 * (attempt + 1))
+                    continue
+                return ""
+        return ""
+
     def get_react_agent_role_prompt(self) -> str:
         """给 Agent 家族共享同一份角色设定。"""
 
@@ -112,6 +142,15 @@ class LLMClient:
         if start == -1 or end == -1 or end <= start:
             return ""
         return content[start : end + 1]
+
+    def _clean_text_response(self, content: str) -> str:
+        """尽量把模型纯文本输出收敛成可直接展示的正文。"""
+
+        cleaned = content.strip()
+        if cleaned.startswith("```"):
+            cleaned = cleaned.removeprefix("```text").removeprefix("```markdown")
+            cleaned = cleaned.removeprefix("```").removesuffix("```").strip()
+        return cleaned
 
     def _is_rate_limit_error(self, exc: Exception) -> bool:
         """兼容不同 SDK 版本的限流异常识别。"""

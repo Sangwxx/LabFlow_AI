@@ -17,7 +17,7 @@ from labflow.ui.pdf_viewer import render_pdf_viewer
 from labflow.ui.sidebar import SidebarState, render_sidebar
 
 EVIDENCE_BUILDER = EvidenceBuilder()
-ALIGNMENT_CACHE_VERSION = "learning-output-v5"
+ALIGNMENT_CACHE_VERSION = "learning-output-v12"
 
 
 @dataclass(frozen=True)
@@ -336,6 +336,15 @@ def format_section_label(section: PaperSection) -> str:
     return f"P{section.page_number} · {section.title} · {preview}"
 
 
+def resolve_focus_section_index(sections: tuple[PaperSection, ...], block_order: int) -> int | None:
+    for index, section in enumerate(sections):
+        if section.order == block_order:
+            return index
+        if section.block_orders and block_order in section.block_orders:
+            return index
+    return None
+
+
 def sync_hotspot_selection(workspace: WorkspaceState) -> None:
     if not workspace.focus_sections:
         return
@@ -346,10 +355,9 @@ def sync_hotspot_selection(workspace: WorkspaceState) -> None:
         block_order = int(focus_block)
     except (TypeError, ValueError):
         return
-    for index, section in enumerate(workspace.focus_sections):
-        if section.order == block_order:
-            st.session_state["selected_section_index"] = index
-            break
+    section_index = resolve_focus_section_index(workspace.focus_sections, block_order)
+    if section_index is not None:
+        st.session_state["selected_section_index"] = section_index
 
 
 def render_code_panel(workspace: WorkspaceState, selected_section: PaperSection | None) -> None:
@@ -419,11 +427,18 @@ def get_semantic_alignment(
 
 
 def render_trace_panel(placeholder, trace_events: list[dict], *, finalized: bool) -> None:
-    if not trace_events or finalized:
+    if not trace_events:
         placeholder.empty()
         return
 
     with placeholder.container():
+        if finalized:
+            with st.expander("查看推理链路", expanded=False):
+                with st.container(height=300):
+                    for event in trace_events:
+                        render_trace_event(event)
+            return
+
         with st.container(height=300):
             status = st.status("Agent 正在推理...", expanded=True)
             for event in trace_events:

@@ -119,6 +119,89 @@ def test_evidence_builder_merges_adjacent_blocks_into_natural_paragraph() -> Non
         "Following language instructions to navigate in unseen environments "
         "is a challenging problem for autonomous embodied agents."
     )
+    assert focus_sections[0].block_orders == (1, 2)
+
+
+def test_evidence_builder_merges_cross_page_continuation() -> None:
+    """段落跨页延续时，我要继续把它还原成同一段。"""
+
+    pdf_result = PDFParseResult(
+        source_name="paper.pdf",
+        page_count=2,
+        blocks=(
+            PDFBlock(kind="title", text="3 Method", page_number=1, order=0, font_size=18),
+            PDFBlock(
+                kind="paragraph",
+                text="We maintain a latent map representation that keeps growing",
+                page_number=1,
+                order=1,
+                font_size=11,
+                bbox=(40.0, 710.0, 285.0, 780.0),
+                page_width=595.0,
+                page_height=842.0,
+            ),
+            PDFBlock(
+                kind="paragraph",
+                text="as the agent explores unseen environments during rollout.",
+                page_number=2,
+                order=2,
+                font_size=11,
+                bbox=(40.0, 48.0, 288.0, 118.0),
+                page_width=595.0,
+                page_height=842.0,
+            ),
+        ),
+    )
+
+    focus_sections = EvidenceBuilder().build_focus_sections(pdf_result)
+
+    assert len(focus_sections) == 1
+    assert focus_sections[0].content == (
+        "We maintain a latent map representation that keeps growing "
+        "as the agent explores unseen environments during rollout."
+    )
+    assert focus_sections[0].block_orders == (1, 2)
+
+
+def test_evidence_builder_merges_cross_column_continuation() -> None:
+    """双栏论文里，同一段跨列延续时也应继续合并。"""
+
+    pdf_result = PDFParseResult(
+        source_name="paper.pdf",
+        page_count=1,
+        blocks=(
+            PDFBlock(kind="title", text="Abstract", page_number=1, order=0, font_size=18),
+            PDFBlock(
+                kind="paragraph",
+                text="The proposed dual-scale encoder improves exploration efficiency",
+                page_number=1,
+                order=1,
+                font_size=11,
+                bbox=(40.0, 520.0, 280.0, 690.0),
+                page_width=595.0,
+                page_height=842.0,
+            ),
+            PDFBlock(
+                kind="paragraph",
+                text="by switching between local grounding and global planning cues.",
+                page_number=1,
+                order=2,
+                font_size=11,
+                bbox=(334.0, 72.0, 572.0, 160.0),
+                page_width=595.0,
+                page_height=842.0,
+            ),
+        ),
+    )
+
+    focus_sections = EvidenceBuilder().build_focus_sections(pdf_result)
+
+    assert len(focus_sections) == 1
+    assert focus_sections[0].content == (
+        "The proposed dual-scale encoder improves exploration efficiency "
+        "by switching between local grounding and global planning cues."
+    )
+    assert focus_sections[0].block_orders == (1, 2)
 
 
 def test_evidence_builder_recalls_relevant_section_from_diff() -> None:

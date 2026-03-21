@@ -140,25 +140,184 @@ class FakeStructuredStringLLMClient(FakeUnavailableLLMClient):
     """我专门模拟模型把结构化对象塞进字符串字段里的脏输出。"""
 
     def generate_json(self, *, system_prompt: str, **_: object) -> dict | None:
-        if "学术导读模式" in system_prompt:
+        if "你的任务只有一个：把给定论文片段完整翻译成自然、准确的中文。" in system_prompt:
             return {
-                "analysis": (
+                "translation": (
                     "{'paper_title': 'DUET', 'core_problem': 'Vision-Language Navigation "
                     "requires agents to follow natural language instructions in unseen "
                     "environments.'}"
-                ),
+                )
+            }
+        if "你的任务只有一个：提炼论文片段的 3 条核心要点。" in system_prompt:
+            return {
                 "semantic_evidence": (
                     "{'core_problem': 'Vision-Language Navigation requires agents to follow "
                     "natural language instructions in unseen environments.', "
                     "'key_innovation': 'The method uses a dual-scale architecture.', "
                     "'technical_approach': 'It combines local grounding with global planning.'}"
-                ),
+                )
+            }
+        if "你的任务只有一个：解释论文片段中的 2 到 3 个关键专业术语。" in system_prompt:
+            return {
                 "research_supplement": (
                     "{'related_concepts': {'Embodied AI': 'Embodied AI is about agents acting "
                     "in the world.', 'Unseen Environment': 'An unseen environment is a new "
                     "scene not observed during training.'}, 'significance': 'This setting tests "
                     "generalization.'}"
+                )
+            }
+        return None
+
+
+class FakeColonTranslationLLMClient(FakeUnavailableLLMClient):
+    """我专门模拟模型把译文字段错误地只返回一个冒号。"""
+
+    def generate_json(self, *, system_prompt: str, **_: object) -> dict | None:
+        if "你的任务只有一个：提炼论文片段的 3 条核心要点。" in system_prompt:
+            return {
+                "semantic_evidence": (
+                    "- 这段先定义了 Vision-Language Navigation 任务的基本挑战。\n"
+                    "- 作者强调难点不只是理解语言，还包括在新环境中完成探索。\n"
+                    "- 这为后续提出 DUET 的双尺度建模思路埋下了动机。"
                 ),
+            }
+        if "你的任务只有一个：解释论文片段中的 2 到 3 个关键专业术语。" in system_prompt:
+            return {
+                "research_supplement": (
+                    "- **Grounding**：把语言和场景、动作真正对应起来。\n"
+                    "- **Topological Map**：更关注地点之间连通关系的地图表示。\n"
+                    "- **Dual-Scale**：同时建模全局与局部两个尺度。"
+                ),
+            }
+        if "你是一个学术翻译助手。" in system_prompt:
+            return {
+                "translation": (
+                    "在未知环境中根据语言指令完成导航，对自主具身智能体来说是一个具有挑战性的问题。"
+                )
+            }
+        return None
+
+
+class FakeSequentialLearningLLMClient(FakeUnavailableLLMClient):
+    """我记录调用顺序，确保学术导读模式真的按翻译 -> 要点 -> 术语执行。"""
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def generate_json(self, *, system_prompt: str, **_: object) -> dict | None:
+        if "你是一个学术翻译助手。" in system_prompt:
+            self.calls.append("translation")
+            return {
+                "translation": (
+                    "在未知环境中根据语言指令完成导航，对自主具身智能体来说是一个具有挑战性的问题。"
+                )
+            }
+        if "你的任务只有一个：提炼论文片段的 3 条核心要点。" in system_prompt:
+            self.calls.append("core_points")
+            return {
+                "semantic_evidence": [
+                    "这段先定义了 VLN 任务的基本挑战。",
+                    "作者强调语言理解和环境探索必须同时成立。",
+                    "这为后续提出双尺度方法提供了直接动机。",
+                ]
+            }
+        if "你的任务只有一个：解释论文片段中的 2 到 3 个关键专业术语。" in system_prompt:
+            self.calls.append("glossary")
+            return {
+                "research_supplement": [
+                    "**Grounding**：把语言和场景、动作真正对应起来。",
+                    "**Unseen Environment**：训练阶段没见过、测试时才遇到的新环境。",
+                    "**Navigation**：根据指令持续决策并到达目标位置。",
+                ]
+            }
+        return None
+
+
+class FakeTextFallbackTranslationLLMClient(FakeUnavailableLLMClient):
+    """我模拟 JSON 翻译失败，但纯文本翻译链可以成功救回来。"""
+
+    def generate_json(self, *, system_prompt: str, **_: object) -> dict | None:
+        if "你是一个学术翻译助手。" in system_prompt:
+            return None
+        if "你的任务只有一个：提炼论文片段的 3 条核心要点。" in system_prompt:
+            return {
+                "semantic_evidence": [
+                    "这段先定义了任务背景与基本挑战。",
+                    "作者强调语言理解与环境探索必须同时成立。",
+                    "这为后续的方法设计提供了清晰动机。",
+                ]
+            }
+        if "你的任务只有一个：解释论文片段中的 2 到 3 个关键专业术语。" in system_prompt:
+            return {
+                "research_supplement": [
+                    "**Grounding**：把语言与场景、动作对应起来。",
+                    "**Unseen Environment**：训练阶段没有见过的新环境。",
+                ]
+            }
+        return None
+
+    def generate_text(self, *, system_prompt: str, **_: object) -> str:
+        if "你是一个学术翻译助手。" in system_prompt:
+            return "在未知环境中根据语言指令完成导航，对自主具身智能体来说是一个具有挑战性的问题。"
+        return ""
+
+
+class FakeSegmentedTranslationLLMClient(FakeUnavailableLLMClient):
+    """我模拟整段翻译失败，但分句翻译可以成功。"""
+
+    def generate_json(self, *, system_prompt: str, **_: object) -> dict | None:
+        if "你的任务只有一个：提炼论文片段的 3 条核心要点。" in system_prompt:
+            return {
+                "semantic_evidence": [
+                    "这段定义了任务背景。",
+                    "作者强调理解语言和探索环境要同时成立。",
+                    "这为后续方法设计提供了动机。",
+                ]
+            }
+        if "你的任务只有一个：解释论文片段中的 2 到 3 个关键专业术语。" in system_prompt:
+            return {
+                "research_supplement": [
+                    "**Grounding**：让语言与环境实体建立对应关系。",
+                    "**Navigation**：根据指令持续决策并到达目标。",
+                ]
+            }
+        return None
+
+    def generate_text(self, *, user_prompt: str, **_: object) -> str:
+        if "【待翻译论文片段】" in user_prompt:
+            return ""
+        if "Following language instructions to navigate in unseen environments" in user_prompt:
+            return "在未知环境中根据语言指令完成导航，是一个很有挑战性的问题。"
+        if "The agent not only needs to ground languages in visual scenes" in user_prompt:
+            return "智能体不仅需要把语言与视觉场景对齐，还需要探索环境以到达目标。"
+        return ""
+
+
+class FakeMixedChineseTranslationLLMClient(FakeUnavailableLLMClient):
+    """我模拟模型返回夹带英文缩写的中文译文，系统也应当接受。"""
+
+    def generate_json(self, *, system_prompt: str, **_: object) -> dict | None:
+        if "你是一个学术翻译助手。" in system_prompt:
+            return {
+                "translation": (
+                    "DUET 在 REVERIE、SOON 和 R2R 等 VLN 基准上显著优于现有方法，"
+                    "同时提升了细粒度导航任务中的成功率。"
+                )
+            }
+        if "你的任务只有一个：提炼论文片段的 3 条核心要点。" in system_prompt:
+            return {
+                "semantic_evidence": [
+                    "作者强调方法在多个 VLN 基准上都优于现有方案。",
+                    "这段突出了 DUET 的整体性能提升。",
+                    "细粒度导航任务上的成功率提升也是重点结果。",
+                ]
+            }
+        if "你的任务只有一个：解释论文片段中的 2 到 3 个关键专业术语。" in system_prompt:
+            return {
+                "research_supplement": [
+                    "**VLN**：视觉语言导航任务。",
+                    "**REVERIE**：目标导向导航基准。",
+                ]
             }
         return None
 
@@ -402,7 +561,7 @@ def test_agent_refuses_to_force_irrelevant_method_alignment() -> None:
 
     assert result is not None
     assert result.match_type == "missing_implementation"
-    assert "theoretical objective" in result.analysis
+    assert "当前模型这一轮没有稳定产出完整中文译文" in result.analysis
     assert result.semantic_evidence.count("- ") == 3
     assert "无直接对应的算子实现" in result.confidence_note
 
@@ -435,6 +594,244 @@ def test_agent_sanitizes_structured_string_output_into_learning_sections() -> No
     assert not result.research_supplement.startswith("{")
     assert result.semantic_evidence.count("- ") == 3
     assert "Embodied AI" in result.research_supplement
+
+
+def test_agent_repairs_colon_only_translation_output() -> None:
+    """译文字段如果只剩一个冒号，我必须触发学习助手修复。"""
+
+    section = PaperSection(
+        title="Abstract",
+        content=(
+            "Following language instructions to navigate in unseen environments is a challenging "
+            "problem for autonomous embodied agents."
+        ),
+        level=1,
+        page_number=1,
+        order=1,
+    )
+
+    result = PlanAndExecuteAgent(
+        llm_client=FakeColonTranslationLLMClient(),
+        evidence_builder=EvidenceBuilder(),
+    ).run(
+        section,
+        (),
+        project_structure="",
+    )
+
+    assert result is not None
+    assert result.analysis != ":"
+    assert "具身智能体" in result.analysis
+    assert result.semantic_evidence.count("- ") == 3
+    assert result.research_supplement.count("- ") >= 2
+
+
+def test_agent_uses_dedicated_translation_step_when_main_output_is_english() -> None:
+    """主输出链即使给出英文，独立翻译链也要把译文救回来。"""
+
+    section = PaperSection(
+        title="Abstract",
+        content=(
+            "Following language instructions to navigate in unseen environments is a challenging "
+            "problem for autonomous embodied agents."
+        ),
+        level=1,
+        page_number=1,
+        order=1,
+    )
+
+    result = PlanAndExecuteAgent(
+        llm_client=FakeColonTranslationLLMClient(),
+        evidence_builder=EvidenceBuilder(),
+    ).run(
+        section,
+        (),
+        project_structure="",
+    )
+
+    assert result is not None
+    assert "语言指令" in result.analysis
+    assert "具身智能体" in result.analysis
+    assert "Following language instructions" not in result.analysis
+
+
+def test_agent_does_not_use_english_raw_text_as_translation_fallback() -> None:
+    """当学习助手修复失败时，译文区也不该直接回退成英文原文。"""
+
+    section = PaperSection(
+        title="Abstract",
+        content=(
+            "Following language instructions to navigate in unseen environments is a challenging "
+            "problem for autonomous embodied agents."
+        ),
+        level=1,
+        page_number=1,
+        order=1,
+    )
+
+    result = PlanAndExecuteAgent(
+        llm_client=FakeUnavailableLLMClient(),
+        evidence_builder=EvidenceBuilder(),
+    ).run(
+        section,
+        (),
+        project_structure="",
+    )
+
+    assert result is not None
+    assert "当前模型这一轮没有稳定产出完整中文译文" in result.analysis
+    assert "Following language instructions" not in result.analysis
+
+
+def test_agent_runs_learning_sections_in_sequence() -> None:
+    """学术导读模式必须先翻译，再做要点，最后才做术语。"""
+
+    llm_client = FakeSequentialLearningLLMClient()
+    section = PaperSection(
+        title="Abstract",
+        content=(
+            "Following language instructions to navigate in unseen environments is a challenging "
+            "problem for autonomous embodied agents."
+        ),
+        level=1,
+        page_number=1,
+        order=1,
+    )
+
+    result = PlanAndExecuteAgent(
+        llm_client=llm_client,
+        evidence_builder=EvidenceBuilder(),
+    ).run(
+        section,
+        (),
+        project_structure="",
+    )
+
+    assert result is not None
+    assert llm_client.calls == ["translation", "core_points", "glossary"]
+    assert "自主具身智能体" in result.analysis
+    assert result.semantic_evidence.count("- ") == 3
+    assert result.research_supplement.count("- ") >= 2
+
+
+def test_agent_uses_plain_text_translation_fallback_when_json_translation_fails() -> None:
+    """JSON 译文失败时，仍应切到纯文本翻译链拿回中文译文。"""
+
+    section = PaperSection(
+        title="1. Introduction",
+        content=(
+            "Following language instructions to navigate in unseen environments is a challenging "
+            "problem for autonomous embodied agents."
+        ),
+        level=1,
+        page_number=1,
+        order=1,
+    )
+
+    result = PlanAndExecuteAgent(
+        llm_client=FakeTextFallbackTranslationLLMClient(),
+        evidence_builder=EvidenceBuilder(),
+    ).run(
+        section,
+        (),
+        project_structure="",
+    )
+
+    assert result is not None
+    assert "自主具身智能体" in result.analysis
+    assert "当前模型这一轮没有稳定产出完整中文译文" not in result.analysis
+
+
+def test_agent_uses_segment_translation_when_full_translation_fails() -> None:
+    """整段翻译失败时，仍应退到分句翻译链。"""
+
+    section = PaperSection(
+        title="Abstract",
+        content=(
+            "Following language instructions to navigate in unseen environments is a challenging "
+            "problem. The agent not only needs to ground languages in visual scenes but also "
+            "explore the environment to reach its target."
+        ),
+        level=1,
+        page_number=1,
+        order=1,
+    )
+
+    result = PlanAndExecuteAgent(
+        llm_client=FakeSegmentedTranslationLLMClient(),
+        evidence_builder=EvidenceBuilder(),
+    ).run(
+        section,
+        (),
+        project_structure="",
+    )
+
+    assert result is not None
+    assert "在未知环境中根据语言指令完成导航" in result.analysis
+    assert "探索环境以到达目标" in result.analysis
+    assert "当前模型这一轮没有稳定产出完整中文译文" not in result.analysis
+
+
+def test_academic_guide_mode_emits_multiple_trace_events() -> None:
+    """学术导读模式也应显式展示翻译、要点、术语三个动作。"""
+
+    events: list[dict] = []
+    section = PaperSection(
+        title="Abstract",
+        content=(
+            "Following language instructions to navigate in unseen environments is a challenging "
+            "problem for autonomous embodied agents."
+        ),
+        level=1,
+        page_number=1,
+        order=1,
+    )
+
+    PlanAndExecuteAgent(
+        llm_client=FakeSequentialLearningLLMClient(),
+        evidence_builder=EvidenceBuilder(),
+    ).run(
+        section,
+        (),
+        project_structure="",
+        event_handler=events.append,
+    )
+
+    action_messages = [
+        str(event.get("message", "")) for event in events if event.get("kind") == "action"
+    ]
+    assert action_messages == [
+        "translate_section",
+        "summarize_key_points",
+        "build_glossary",
+    ]
+
+
+def test_agent_accepts_chinese_translation_with_english_acronyms() -> None:
+    """带英文缩写的中文译文不应再被误判成失败。"""
+
+    section = PaperSection(
+        title="Abstract",
+        content=(
+            "DUET significantly outperforms state-of-the-art methods on REVERIE, SOON and R2R."
+        ),
+        level=1,
+        page_number=1,
+        order=1,
+    )
+
+    result = PlanAndExecuteAgent(
+        llm_client=FakeMixedChineseTranslationLLMClient(),
+        evidence_builder=EvidenceBuilder(),
+    ).run(
+        section,
+        (),
+        project_structure="",
+    )
+
+    assert result is not None
+    assert "显著优于现有方法" in result.analysis
+    assert "当前模型这一轮没有稳定产出完整中文译文" not in result.analysis
 
 
 def test_aligner_class_keeps_compatibility_entrypoint() -> None:
