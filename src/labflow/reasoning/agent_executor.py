@@ -7,6 +7,30 @@ from collections.abc import Callable
 from dataclasses import replace
 
 from labflow.clients.llm_client import LLMClient
+from labflow.reasoning.agent_engine import (
+    PlanAndExecuteEngine as RuntimeEngine,
+)
+from labflow.reasoning.agent_engine import (
+    PlanAndExecuteExecutor as RuntimeExecutor,
+)
+from labflow.reasoning.agent_engine import (
+    PlanAndExecutePlanner as RuntimePlanner,
+)
+from labflow.reasoning.agent_engine import (
+    PlanAndExecuteRePlanner as RuntimeRePlanner,
+)
+from labflow.reasoning.agent_prompts import (
+    build_final_answer_system_prompt,
+    build_final_answer_user_prompt,
+    build_learning_core_points_system_prompt,
+    build_learning_glossary_system_prompt,
+    build_reflection_system_prompt,
+    build_reflection_user_prompt,
+    build_translation_json_system_prompt,
+    build_translation_segment_system_prompt,
+    build_translation_text_system_prompt,
+)
+from labflow.reasoning.agent_tools import ReasoningToolbox
 from labflow.reasoning.evidence_builder import EvidenceBuilder
 from labflow.reasoning.models import (
     AlignmentCandidate,
@@ -506,9 +530,19 @@ class PlanAndExecuteAgent:
     def __init__(self, llm_client=None, evidence_builder: EvidenceBuilder | None = None) -> None:
         self._llm_client = llm_client or LLMClient()
         self._evidence_builder = evidence_builder or EvidenceBuilder()
-        self.planner = PlanAndExecutePlanner(self._llm_client)
-        self.executor = PlanAndExecuteExecutor(self._llm_client, self._evidence_builder)
-        self.replanner = PlanAndExecuteRePlanner(self._llm_client)
+        self._tool_registry = ReasoningToolbox(self._evidence_builder).build_registry()
+        self.planner = RuntimePlanner(self._llm_client)
+        self.executor = RuntimeExecutor(
+            self._llm_client,
+            self._evidence_builder,
+            tool_registry=self._tool_registry,
+        )
+        self.replanner = RuntimeRePlanner(self._llm_client)
+        self.engine = RuntimeEngine(
+            planner=self.planner,
+            executor=self.executor,
+            replanner=self.replanner,
+        )
 
     def run(
         self,
@@ -562,45 +596,19 @@ class PlanAndExecuteAgent:
                 paper_section,
             )
 
-        plan = self.planner.create_plan(
-            paper_section,
+        current_plan, step_traces, current_candidates = self.engine.run(
+            paper_section=paper_section,
             project_structure=project_structure,
+            code_evidences=code_evidences,
+            current_candidates=current_candidates,
             role_prompt=role_prompt,
+            event_handler=event_handler,
         )
-        self._emit_plan(plan, event_handler)
-
-        step_traces: list[StepExecutionTrace] = []
-        current_plan = plan
-
-        while current_plan.steps and not current_plan.is_finished:
-            step = current_plan.steps[0]
-            self._emit(
-                event_handler,
-                kind="current_plan",
-                message=step.display_text,
-                remaining_steps=tuple(item.display_text for item in current_plan.steps),
-            )
-            trace, current_candidates = self.executor.execute(
-                step,
-                paper_section=paper_section,
-                project_structure=project_structure,
-                code_evidences=code_evidences,
-                current_candidates=current_candidates,
-                role_prompt=role_prompt,
-                event_handler=event_handler,
-            )
-            step_traces.append(trace)
-            current_plan = self.replanner.update_plan(
-                current_plan,
-                trace,
-                role_prompt=role_prompt,
-            )
-            self._emit_plan(current_plan, event_handler)
 
         result = self._build_final_answer(
             paper_section=paper_section,
             current_candidates=current_candidates,
-            step_traces=tuple(step_traces),
+            step_traces=step_traces,
             current_plan=current_plan,
             role_prompt=role_prompt,
         )
@@ -636,28 +644,8 @@ class PlanAndExecuteAgent:
         role_prompt: str,
     ) -> AlignmentResult:
         payload = self._llm_client.generate_json(
-            system_prompt="\n".join(
-                [
-                    role_prompt,
-                    "你当前在输出 Final Answer。",
-                    "你的输出定位是科研学习助手，不是错误日志或评分器。",
-                    "【中文译文】必须且只能写论文片段的中文翻译，不能讨论代码、模式切换或证据不足。",
-                    "【核心要点】必须是 3 条中文列表，提炼这段话最重要的 3 个学术观点。",
-                    "【术语百科】必须挑选 2 到 3 个专业英文词汇做通俗解释。",
-                    "严禁输出变量映射表、证据等级、自我审计这类内部术语。",
-                    "如果代码证据足够强，才填写源码落地，并说明具体代码行如何实现论文思想。",
-                    "如果代码证据不够强，就把 implementation_chain 留空，不要硬凑源码解释。",
-                    "核心要点必须用大白话解释这段话在解决什么问题，但不能提没有找到代码。",
-                    "术语百科要只解释片段里真正重要的专门术语，语言要通俗。",
-                    (
-                        "只输出 JSON，字段包括 "
-                        '{"best_candidate_index", "alignment_score", "match_type", "analysis", '
-                        '"semantic_evidence", "research_supplement", "implementation_chain", '
-                        '"highlighted_lines", "improvement_suggestion"}。'
-                    ),
-                ]
-            ),
-            user_prompt=self._build_final_answer_prompt(
+            system_prompt=build_final_answer_system_prompt(role_prompt),
+            user_prompt=build_final_answer_user_prompt(
                 paper_section,
                 current_candidates,
                 step_traces,
@@ -704,48 +692,6 @@ class PlanAndExecuteAgent:
             ),
         )
 
-    def _build_final_answer_prompt(
-        self,
-        paper_section: PaperSection,
-        current_candidates: tuple[AlignmentCandidate, ...],
-        step_traces: tuple[StepExecutionTrace, ...],
-    ) -> str:
-        traces = (
-            "\n".join(
-                [
-                    (
-                        f"[Current Plan] {trace.step.display_text}\n"
-                        f"[Thought] {trace.thought}\n"
-                        f"[Action] {trace.action}\n"
-                        f"[Observation] {trace.observation}"
-                    )
-                    for trace in step_traces
-                ]
-            )
-            or "无"
-        )
-        candidates = "\n".join(
-            [
-                (
-                    f"[候选 {index}]\n"
-                    f"文件: {candidate.code_evidence.file_name}\n"
-                    f"范围: "
-                    f"L{candidate.code_evidence.start_line}"
-                    f"-L{candidate.code_evidence.end_line}\n"
-                    f"逻辑块类型: {candidate.code_evidence.block_type}\n"
-                    f"符号: {candidate.code_evidence.symbol_name or '未命名逻辑块'}\n"
-                    f"Docstring: {candidate.code_evidence.docstring or '无'}\n"
-                    f"代码:\n{candidate.code_evidence.code_snippet}"
-                )
-                for index, candidate in enumerate(current_candidates)
-            ]
-        )
-        return (
-            f"【论文片段】{paper_section.combined_text}\n\n"
-            f"【执行轨迹】\n{traces}\n\n"
-            f"【候选代码】\n{candidates}"
-        )
-
     def _reflect(
         self,
         result: AlignmentResult,
@@ -754,27 +700,8 @@ class PlanAndExecuteAgent:
         role_prompt: str,
     ) -> AlignmentResult:
         payload = self._llm_client.generate_json(
-            system_prompt="\n".join(
-                [
-                    role_prompt,
-                    "你当前在做 Reflection。",
-                    "请审计最终结论是否过度自信。",
-                    "如果置信度低于 0.8，必须建议人工核对。",
-                    (
-                        "只输出 JSON，格式为 "
-                        '{"reflection": "...", "final_confidence": 0.0, '
-                        '"confidence_note": "...", "needs_manual_review": true/false}。'
-                    ),
-                ]
-            ),
-            user_prompt=(
-                f"【论文片段】{paper_section.combined_text}\n\n"
-                f"【当前结论】{result.analysis}\n\n"
-                f"【实现链路】{result.implementation_chain}\n\n"
-                f"【算子核对】{result.operator_alignment}\n\n"
-                f"【形状核对】{result.shape_alignment}\n\n"
-                f"【科研补完】{result.research_supplement}"
-            ),
+            system_prompt=build_reflection_system_prompt(role_prompt),
+            user_prompt=build_reflection_user_prompt(paper_section, result),
             temperature=0.0,
             max_tokens=900,
         )
@@ -1139,14 +1066,7 @@ class PlanAndExecuteAgent:
             return text
 
         payload = self._llm_client.generate_json(
-            system_prompt="\n".join(
-                [
-                    "你是一个学术翻译助手。",
-                    "你的任务只有一个：把给定论文片段完整翻译成自然、准确的中文。",
-                    "不要总结，不要解释，不要输出术语百科，不要讨论代码。",
-                    '只输出 JSON，格式为 {"translation": "..."}。',
-                ]
-            ),
+            system_prompt=build_translation_json_system_prompt(),
             user_prompt=f"【待翻译论文片段】{paper_section.content}",
             temperature=0.0,
             max_tokens=1200,
@@ -1159,14 +1079,7 @@ class PlanAndExecuteAgent:
         generate_text = getattr(self._llm_client, "generate_text", None)
         if callable(generate_text):
             translated_text = generate_text(
-                system_prompt="\n".join(
-                    [
-                        "你是一个学术翻译助手。",
-                        "请把给定论文片段完整翻译成自然、准确、流畅的中文。",
-                        "不要总结，不要解释，不要补充背景，不要讨论代码。",
-                        "只输出中文译文正文。",
-                    ]
-                ),
+                system_prompt=build_translation_text_system_prompt(),
                 user_prompt=f"【待翻译论文片段】{paper_section.content}",
                 temperature=0.0,
                 max_tokens=1400,
@@ -1196,13 +1109,7 @@ class PlanAndExecuteAgent:
         translated_segments: list[str] = []
         for segment in segments:
             translated = generate_text(
-                system_prompt="\n".join(
-                    [
-                        "你是一个学术翻译助手。",
-                        "请把给定英文片段准确翻译成自然、流畅的中文。",
-                        "不要总结，不要解释，只输出中文译文。",
-                    ]
-                ),
+                system_prompt=build_translation_segment_system_prompt(),
                 user_prompt=f"【待翻译片段】{segment}",
                 temperature=0.0,
                 max_tokens=500,
@@ -1282,15 +1189,7 @@ class PlanAndExecuteAgent:
             return normalized
 
         payload = self._llm_client.generate_json(
-            system_prompt="\n".join(
-                [
-                    "你是一个耐心的科研学习助手。",
-                    "你的任务只有一个：提炼论文片段的 3 条核心要点。",
-                    "输出必须是中文列表，每条都要讲清这段话在解决什么问题或提出什么关键思想。",
-                    "不要讨论代码，不要解释为什么没有匹配到代码，不要输出 JSON 以外的多余文字。",
-                    '只输出 JSON，格式为 {"semantic_evidence": ["...", "...", "..."]}。',
-                ]
-            ),
+            system_prompt=build_learning_core_points_system_prompt(),
             user_prompt=(f"【论文片段原文】{paper_section.content}\n\n【中文译文】{translation}"),
             temperature=0.1,
             max_tokens=900,
@@ -1334,15 +1233,7 @@ class PlanAndExecuteAgent:
             return normalized
 
         payload = self._llm_client.generate_json(
-            system_prompt="\n".join(
-                [
-                    "你是一个耐心的科研学习助手。",
-                    "你的任务只有一个：解释论文片段中的 2 到 3 个关键专业术语。",
-                    "输出必须是中文列表，每条都要先写术语，再做通俗解释。",
-                    "不要讨论代码，不要输出实现链路，不要解释内部推理状态。",
-                    '只输出 JSON，格式为 {"research_supplement": ["...", "..."]}。',
-                ]
-            ),
+            system_prompt=build_learning_glossary_system_prompt(),
             user_prompt=(
                 f"【论文片段原文】{paper_section.content}\n\n"
                 f"【中文译文】{translation}\n\n"

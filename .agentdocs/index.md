@@ -25,6 +25,9 @@
 - `.agentdocs/workflow/260319-project-bootstrap-planning.md`
   - 读取场景：开始项目规划、初始化工程骨架、确认阶段目标前必读。
   - 主要内容：当前仓库状态、比赛约束整理、推荐架构、分阶段实施计划、待确认事项。
+- `.agentdocs/workflow/260322-refactor-agent-runtime.md`
+  - 读取场景：重构推理层 Agent 运行时、拆分 Prompt / Tool / Engine 架构前必读。
+  - 主要内容：当前推理层问题、LangChain 风格三层解耦目标、实施阶段与兼容迁移约束。
 
 ## 仓库外层输入资料
 
