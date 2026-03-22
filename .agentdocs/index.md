@@ -28,6 +28,9 @@
 - `.agentdocs/workflow/260322-refactor-agent-runtime.md`
   - 读取场景：重构推理层 Agent 运行时、拆分 Prompt / Tool / Engine 架构前必读。
   - 主要内容：当前推理层问题、LangChain 风格三层解耦目标、实施阶段与兼容迁移约束。
+- `.agentdocs/workflow/260322-modular-agent-orchestration.md`
+  - 读取场景：继续把推理层拆成 Planner + 多子 Agent，并恢复代码对齐链可见性时必读。
+  - 主要内容：模块化子 Agent 方案、Planner 决策字段、源码展示阈值调整与测试范围。
 
 ## 仓库外层输入资料
 

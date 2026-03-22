@@ -16,6 +16,30 @@ class FakeBrokenSemanticLLMClient:
         return 0.5
 
 
+class FakeSemanticSummaryLLMClient:
+    """我给代码卡片补一层更贴近论文术语的语义摘要。"""
+
+    def generate_json(self, *, user_prompt: str, **_: object) -> dict:
+        if "topo.py" in user_prompt:
+            return {
+                "summary": "这段代码负责维护导航过程中的拓扑地图并生成全局规划特征。",
+                "responsibilities": [
+                    "维护 topological map",
+                    "聚合全局图结构供导航策略使用",
+                ],
+                "defined_symbols": ["build_memory_bank"],
+                "called_symbols": ["update_graph", "encode_global_map"],
+                "anchor_terms": ["topological map", "global planning", "graph memory"],
+            }
+        return {
+            "summary": "这段代码主要做日志输出和通用工具处理。",
+            "responsibilities": ["记录日志"],
+            "defined_symbols": ["write_log"],
+            "called_symbols": ["print"],
+            "anchor_terms": ["logging"],
+        }
+
+
 def test_evidence_builder_builds_sections_from_pdf_blocks() -> None:
     """我会把标题块和正文块重新拼成章节。"""
 
@@ -399,6 +423,53 @@ def test_evidence_builder_can_trace_related_candidates_by_symbol_chain() -> None
 
     assert traced_candidates
     assert traced_candidates[0].code_evidence.file_name == "projection.py"
+
+
+def test_evidence_builder_retrieves_candidates_from_semantic_cards() -> None:
+    """代码卡片里的语义摘要应该能把论文机制召回到真正相关的实现文件。"""
+
+    builder = EvidenceBuilder()
+    paper_section = PaperSection(
+        title="3.2 Global Planning",
+        content=(
+            "We maintain a topological map for efficient global planning in unseen environments."
+        ),
+        level=2,
+        page_number=3,
+        order=5,
+    )
+    semantic_index = builder.build_semantic_index_from_evidences(
+        (
+            CodeEvidence(
+                file_name="topo.py",
+                code_snippet="def build_memory_bank(x):\n    return update_graph(x)\n",
+                related_git_diff="",
+                symbols=("build_memory_bank", "update_graph"),
+                commit_context=(),
+                start_line=10,
+                end_line=11,
+            ),
+            CodeEvidence(
+                file_name="logger.py",
+                code_snippet="def write_log(message):\n    print(message)\n",
+                related_git_diff="",
+                symbols=("write_log",),
+                commit_context=(),
+                start_line=1,
+                end_line=2,
+            ),
+        ),
+        llm_client=FakeSemanticSummaryLLMClient(),
+    )
+
+    candidates = builder.retrieve_semantic_candidates(
+        paper_section,
+        semantic_index,
+        top_k=2,
+    )
+
+    assert candidates
+    assert candidates[0].code_evidence.file_name == "topo.py"
 
 
 def test_evidence_builder_reads_ast_logic_block_with_docstring() -> None:

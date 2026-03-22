@@ -12,6 +12,13 @@ MatchType = Literal[
     "formula_mismatch",
 ]
 
+AgentName = Literal[
+    "translation",
+    "reading_summary",
+    "glossary",
+    "code_grounding",
+]
+
 ToolName = Literal[
     "list_project_structure",
     "read_code_segment",
@@ -140,6 +147,9 @@ class ExecutionPlan:
 
     steps: tuple[PlanStep, ...]
     rationale: str = ""
+    section_type: str = ""
+    enabled_agents: tuple[AgentName, ...] = ()
+    code_focus: tuple[str, ...] = ()
     is_finished: bool = False
     final_summary: str = ""
 
@@ -163,6 +173,7 @@ class StepExecutionTrace:
     observation: str
     tool_invocations: tuple[ToolInvocation, ...]
     produced_candidate_ids: tuple[str, ...] = ()
+    used_fallback: bool = False
 
 
 @dataclass(frozen=True)

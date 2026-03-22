@@ -7,7 +7,7 @@ import re
 import time
 from importlib import import_module
 
-from labflow.config.settings import get_settings
+from labflow.config.settings import Settings, get_settings
 
 REACT_AGENT_ROLE_PROMPT = (
     "你是一个精通 PyTorch 的源码审计专家。"
@@ -22,8 +22,8 @@ REACT_AGENT_ROLE_PROMPT = (
 class LLMClient:
     """我把模型调用细节收口在这里，避免推理层直接碰底层 SDK。"""
 
-    def __init__(self) -> None:
-        self._settings = get_settings()
+    def __init__(self, settings: Settings | None = None) -> None:
+        self._settings = settings or get_settings()
         if not self._settings.has_llm_credentials:
             raise RuntimeError("模型配置不完整，先补齐 `.env` 后再执行对齐分析。")
         self._client = self._build_client()

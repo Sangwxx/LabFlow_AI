@@ -92,7 +92,7 @@ reasoning/
 - [x] 引入 ToolRegistry 并迁移默认工具
 - [x] 引入 Engine while-loop 运行时
 - [x] 让 `PlanAndExecuteAgent` 委托到新 Engine
-- [ ] 保持学术导读模式串行链路不回退
+- [x] 保持学术导读模式串行链路不回退
 - [x] 补充新模块测试并完成全量校验
 
 ## 当前进展

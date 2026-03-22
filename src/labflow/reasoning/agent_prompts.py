@@ -17,14 +17,35 @@ from labflow.reasoning.models import (
 def build_planner_system_prompt(role_prompt: str) -> str:
     schema = {
         "rationale": "中文规划思路",
+        "section_type": "metadata | academic_guide | method | mixed",
+        "enabled_agents": [
+            "translation",
+            "reading_summary",
+            "glossary",
+            "code_grounding",
+        ],
+        "code_focus": ["源码检索焦点"],
         "steps": [{"description": "中文步骤", "objective": "目标"}],
     }
     return "\n".join(
         [
             role_prompt,
             "你当前扮演 Planner。",
-            "请把任务拆成 2 到 4 个可执行步骤。",
-            "优先定位实现入口、追踪定义、核对算子与张量形状。",
+            "你先判断当前论文片段需要启用哪些子 Agent，再决定是否生成代码对齐步骤。",
+            "可启用的子 Agent 只有四个：translation、reading_summary、glossary、code_grounding。",
+            (
+                "如果片段主要是标题、作者信息、摘要背景、引言背景、结论总结，"
+                "不要硬启用 code_grounding。"
+            ),
+            (
+                "如果片段涉及 method、architecture、implementation、module、equation、"
+                "loss、attention、fusion、map、policy 等机制内容，应优先启用 code_grounding。"
+            ),
+            "如果原文已经是中文，translation 可以关闭。",
+            (
+                "当启用 code_grounding 时，请把任务拆成 2 到 4 个可执行步骤，"
+                "并给出 1 到 4 个源码检索焦点。"
+            ),
             "不要把重点放在变量名映射上。",
             f"只输出 JSON，格式为: {json.dumps(schema, ensure_ascii=False)}",
         ]
@@ -35,10 +56,17 @@ def build_planner_user_prompt(
     paper_section: PaperSection,
     *,
     project_structure: str,
+    default_section_type: str,
+    default_enabled_agents: tuple[str, ...],
+    default_code_focus: tuple[str, ...],
 ) -> str:
     return (
-        f"【论文片段】{paper_section.combined_text}\n\n"
-        f"【项目文件树】\n{project_structure or '当前未提供文件树。'}"
+        f"【论文片段】\n{paper_section.combined_text}\n\n"
+        f"【项目文件树】\n{project_structure or '当前未提供文件树。'}\n\n"
+        f"【预审建议】\n"
+        f"- 默认片段类型: {default_section_type}\n"
+        f"- 默认启用模块: {', '.join(default_enabled_agents)}\n"
+        f"- 默认源码焦点: {', '.join(default_code_focus) or '无'}"
     )
 
 
@@ -137,13 +165,13 @@ def format_candidate_summary(
     index: int | None = None,
 ) -> str:
     evidence = candidate.code_evidence
-    prefix = f"候选 {index} | " if index is not None else ""
+    prefix = f"候选{index} | " if index is not None else ""
     symbol = evidence.symbol_name or "未命名逻辑块"
     return (
         f"{prefix}{evidence.file_name} | "
         f"L{evidence.start_line}-L{evidence.end_line} | "
         f"{evidence.block_type} | {symbol} | "
-        f"召回分 {candidate.retrieval_score}"
+        f"召回分 {candidate.retrieval_score:.3f}"
     )
 
 
@@ -156,11 +184,9 @@ def build_final_answer_system_prompt(role_prompt: str) -> str:
             "【中文译文】必须且只能写论文片段的中文翻译，不能讨论代码、模式切换或证据不足。",
             "【核心要点】必须是 3 条中文列表，提炼这段话最重要的 3 个学术观点。",
             "【术语百科】必须挑选 2 到 3 个专业英文词汇做通俗解释。",
-            "严禁输出变量映射表、证据等级、自我审计这类内部术语。",
-            "如果代码证据足够强，才填写源码落地，并说明具体代码行如何实现论文思想。",
+            "只有当代码证据足够强时，才填写 implementation_chain 和 highlighted_lines。",
             "如果代码证据不够强，就把 implementation_chain 留空，不要硬凑源码解释。",
-            "核心要点必须用大白话解释这段话在解决什么问题，但不能提没有找到代码。",
-            "术语百科要只解释片段里真正重要的专门术语，语言要通俗。",
+            "不要输出变量映射表、证据等级、自我审计这类内部术语。",
             (
                 "只输出 JSON，字段包括 "
                 '{"best_candidate_index", "alignment_score", "match_type", "analysis", '

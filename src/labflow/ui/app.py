@@ -7,7 +7,8 @@ from html import escape
 
 import streamlit as st
 
-from labflow.config.settings import get_settings
+from labflow.clients.llm_client import LLMClient
+from labflow.config.settings import Settings, get_settings
 from labflow.parsers.git_repo_parser import GitRepoParser, GitRepoParseResult
 from labflow.parsers.pdf_parser import PDFParser, PDFParseResult
 from labflow.reasoning.agent_executor import PlanAndExecuteAgent
@@ -17,7 +18,7 @@ from labflow.ui.pdf_viewer import render_pdf_viewer
 from labflow.ui.sidebar import SidebarState, render_sidebar
 
 EVIDENCE_BUILDER = EvidenceBuilder()
-ALIGNMENT_CACHE_VERSION = "learning-output-v12"
+ALIGNMENT_CACHE_VERSION = "learning-output-v14"
 
 
 @dataclass(frozen=True)
@@ -44,10 +45,11 @@ def run() -> None:
     inject_styles()
 
     sidebar_state = render_sidebar(settings)
+    runtime_settings = resolve_runtime_settings(settings, sidebar_state)
     sync_sidebar_overrides(sidebar_state)
 
     if st.session_state["current_route"] == "workspace":
-        render_workspace()
+        render_workspace(runtime_settings)
     else:
         render_landing()
 
@@ -65,8 +67,8 @@ def init_session_state() -> None:
 
 
 @st.cache_resource(show_spinner=False)
-def get_alignment_agent() -> PlanAndExecuteAgent:
-    return PlanAndExecuteAgent()
+def get_alignment_agent(settings: Settings) -> PlanAndExecuteAgent:
+    return PlanAndExecuteAgent(llm_client=LLMClient(settings=settings))
 
 
 def render_landing() -> None:
@@ -131,7 +133,7 @@ def render_landing() -> None:
             st.rerun()
 
 
-def render_workspace() -> None:
+def render_workspace(runtime_settings: Settings) -> None:
     workspace = get_workspace_state()
     render_workspace_header()
 
@@ -143,7 +145,19 @@ def render_workspace() -> None:
     with left_column:
         selected_section = render_pdf_panel(workspace)
     with right_column:
-        render_code_panel(workspace, selected_section)
+        render_code_panel(workspace, selected_section, runtime_settings)
+
+
+def resolve_runtime_settings(base_settings: Settings, sidebar_state: SidebarState) -> Settings:
+    """把侧边栏里的临时覆盖合并到当前运行时配置。"""
+
+    return Settings(
+        app_name=base_settings.app_name,
+        app_env=base_settings.app_env,
+        api_key=sidebar_state.api_key or base_settings.api_key,
+        base_url=sidebar_state.base_url or base_settings.base_url,
+        model_name=sidebar_state.model_name or base_settings.model_name,
+    )
 
 
 def render_workspace_header() -> None:
@@ -360,7 +374,11 @@ def sync_hotspot_selection(workspace: WorkspaceState) -> None:
         st.session_state["selected_section_index"] = section_index
 
 
-def render_code_panel(workspace: WorkspaceState, selected_section: PaperSection | None) -> None:
+def render_code_panel(
+    workspace: WorkspaceState,
+    selected_section: PaperSection | None,
+    runtime_settings: Settings,
+) -> None:
     if workspace.repo_error:
         st.error(workspace.repo_error)
         return
@@ -385,6 +403,7 @@ def render_code_panel(workspace: WorkspaceState, selected_section: PaperSection 
                 selected_section=selected_section,
                 repo_result=workspace.repo_result,
                 project_structure=workspace.project_structure,
+                runtime_settings=runtime_settings,
                 event_handler=handle_agent_event,
             )
     except Exception as exc:  # noqa: BLE001
@@ -393,11 +412,11 @@ def render_code_panel(workspace: WorkspaceState, selected_section: PaperSection 
         st.info("本轮已停止推理。建议稍后重试，或先把注意力放回论文片段本身。")
         return
 
-    render_trace_panel(trace_placeholder, trace_events, finalized=True)
+    trace_placeholder.empty()
     if alignment_result is None:
         st.warning("本轮模型没有稳定返回，我已停止展示中间推理链。")
         return
-    render_code_canvas(alignment_result)
+    render_code_canvas(alignment_result, trace_events)
 
 
 def get_semantic_alignment(
@@ -406,6 +425,7 @@ def get_semantic_alignment(
     selected_section: PaperSection,
     repo_result: GitRepoParseResult,
     project_structure: str,
+    runtime_settings: Settings,
     event_handler=None,
 ) -> AlignmentResult | None:
     cache_key = f"{ALIGNMENT_CACHE_VERSION}:{workspace_signature}:{selected_section.order}"
@@ -416,7 +436,7 @@ def get_semantic_alignment(
         return cached_result
 
     code_evidences = load_code_evidences(repo_result)
-    alignment_result = get_alignment_agent().run(
+    alignment_result = get_alignment_agent(runtime_settings).run(
         selected_section,
         code_evidences,
         project_structure=project_structure,
@@ -473,31 +493,59 @@ def render_trace_event(event: dict, status=None) -> None:
         writer(f"**[Current Plan]** {event.get('message', '')}")
 
 
-def render_code_canvas(alignment_result: AlignmentResult) -> None:
-    st.markdown("### 【中文译文】")
-    st.markdown(alignment_result.analysis)
+def render_code_canvas(alignment_result: AlignmentResult, trace_events: list[dict]) -> None:
+    teach_tab, source_tab, trace_tab = st.tabs(["导师讲解", "源码定位", "推理链路"])
 
-    st.markdown("### 【核心要点】")
-    st.markdown(alignment_result.semantic_evidence or "当前暂无重点提炼。")
+    with teach_tab:
+        st.markdown("### 【中文译文】")
+        st.markdown(alignment_result.analysis)
 
-    st.markdown("### 【术语百科】")
-    st.markdown(alignment_result.research_supplement or "这一段没有特别需要额外展开的术语。")
+        st.markdown("### 【核心要点】")
+        st.markdown(alignment_result.semantic_evidence or "当前暂无重点提炼。")
 
-    if should_render_source_grounding(alignment_result):
-        st.markdown("### 【源码落地】")
-        st.caption(
-            f"{alignment_result.code_file_name} · "
-            f"L{alignment_result.code_start_line}-L{alignment_result.code_end_line}"
-        )
-        st.markdown(alignment_result.implementation_chain)
-        with st.container(height=1120):
-            st.markdown(build_highlighted_code_html(alignment_result), unsafe_allow_html=True)
+        st.markdown("### 【术语百科】")
+        st.markdown(alignment_result.research_supplement or "这一段没有特别需要额外展开的术语。")
+
+    with source_tab:
+        render_source_grounding_tab(alignment_result)
+
+    with trace_tab:
+        render_trace_tab(trace_events)
+
+
+def render_source_grounding_tab(alignment_result: AlignmentResult) -> None:
+    if not should_render_source_grounding(alignment_result):
+        st.info("当前还没有足够稳定的源码落地结果。")
+        return
+
+    st.markdown("### 【源码落地】")
+    st.caption(
+        f"{alignment_result.code_file_name} · "
+        f"L{alignment_result.code_start_line}-L{alignment_result.code_end_line}"
+    )
+    st.markdown(
+        build_source_overview_html(alignment_result),
+        unsafe_allow_html=True,
+    )
+
+    st.markdown("### 【对应代码】")
+    with st.container(height=940):
+        st.markdown(build_highlighted_code_html(alignment_result), unsafe_allow_html=True)
+
+
+def render_trace_tab(trace_events: list[dict]) -> None:
+    if not trace_events:
+        st.info("当前没有可展示的推理链路。")
+        return
+
+    with st.container(height=860):
+        for event in trace_events:
+            render_trace_event(event)
 
 
 def should_render_source_grounding(alignment_result: AlignmentResult) -> bool:
     return (
-        alignment_result.match_type == "strong_match"
-        and alignment_result.alignment_score >= 0.78
+        alignment_result.alignment_score >= 0.52
         and bool(alignment_result.implementation_chain.strip())
         and not alignment_result.code_snippet.startswith("# 当前未定位到对应源码")
     )
@@ -512,22 +560,62 @@ def build_highlighted_code_html(alignment_result: AlignmentResult) -> str:
         is_highlighted = absolute_line in highlighted_lines
         line_class = "code-line code-line-highlight" if is_highlighted else "code-line"
         html_lines.append(
-            f"""
-            <div class="{line_class}">
-                <span class="code-line-number">{absolute_line}</span>
-                <span class="code-line-content">{escape(raw_line) or "&nbsp;"}</span>
-            </div>
-            """
+            (
+                f'<div class="{line_class}">'
+                f'<span class="code-line-number">{absolute_line}</span>'
+                f'<span class="code-line-content">{escape(raw_line) or "&nbsp;"}</span>'
+                "</div>"
+            )
         )
 
-    return f"""
-    <div class="semantic-code-shell">
-        <div class="semantic-code-header">{alignment_result.code_file_name}</div>
-        <div class="semantic-code-body">
-            {"".join(html_lines)}
-        </div>
-    </div>
-    """
+    return (
+        '<div class="semantic-code-shell">'
+        f'<div class="semantic-code-header">{escape(alignment_result.code_file_name)}</div>'
+        f'<div class="semantic-code-body">{"".join(html_lines)}</div>'
+        "</div>"
+    )
+
+
+def build_source_overview_html(alignment_result: AlignmentResult) -> str:
+    cards = [
+        ("命中文件", alignment_result.code_file_name),
+        (
+            "代码范围",
+            f"L{alignment_result.code_start_line}-L{alignment_result.code_end_line}",
+        ),
+        ("对齐分", f"{alignment_result.alignment_score:.2f}"),
+        ("召回分", f"{alignment_result.retrieval_score:.2f}"),
+    ]
+    info_cards = "".join(
+        (
+            '<div class="source-meta-card">'
+            f'<div class="source-meta-label">{label}</div>'
+            f'<div class="source-meta-value">{escape(value)}</div>'
+            "</div>"
+        )
+        for label, value in cards
+    )
+    detail_items = [
+        ("关联说明", alignment_result.implementation_chain),
+        ("算子核对", alignment_result.operator_alignment),
+        ("形状线索", alignment_result.shape_alignment),
+        ("人工复核", alignment_result.confidence_note or "当前无需额外说明。"),
+    ]
+    detail_blocks = "".join(
+        (
+            '<div class="source-detail-block">'
+            f'<div class="source-detail-title">{title}</div>'
+            f'<div class="source-detail-body">{escape(content or "当前暂无补充。")}</div>'
+            "</div>"
+        )
+        for title, content in detail_items
+    )
+    return (
+        '<div class="source-overview-shell">'
+        f'<div class="source-meta-grid">{info_cards}</div>'
+        f"{detail_blocks}"
+        "</div>"
+    )
 
 
 def sync_sidebar_overrides(sidebar_state: SidebarState) -> None:
@@ -542,10 +630,8 @@ def inject_styles() -> None:
     st.markdown(
         """
         <style>
-            @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+SC:wght@400;500;600;700&display=swap');
-
             html, body, [class*="css"] {
-                font-family: "IBM Plex Sans SC", "Microsoft YaHei", sans-serif;
+                font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
             }
 
             #MainMenu,
@@ -673,7 +759,7 @@ def inject_styles() -> None:
                 padding: 0.75rem 0;
                 overflow-x: auto;
                 overflow-y: auto;
-                white-space: pre;
+                white-space: pre-wrap;
             }
 
             .code-line {
@@ -684,6 +770,7 @@ def inject_styles() -> None:
                 font-family: "Source Code Pro", "Consolas", monospace;
                 font-size: 0.92rem;
                 line-height: 1.2;
+                align-items: start;
             }
 
             .code-line-highlight {
@@ -698,7 +785,61 @@ def inject_styles() -> None:
 
             .code-line-content {
                 color: #10253c;
-                white-space: pre;
+                white-space: pre-wrap;
+                word-break: break-word;
+                overflow-wrap: anywhere;
+            }
+
+            .source-overview-shell {
+                display: grid;
+                gap: 0.9rem;
+            }
+
+            .source-meta-grid {
+                display: grid;
+                grid-template-columns: repeat(2, minmax(0, 1fr));
+                gap: 0.75rem;
+            }
+
+            .source-meta-card {
+                padding: 0.85rem 0.95rem;
+                border-radius: 18px;
+                background: rgba(255, 255, 255, 0.78);
+                border: 1px solid rgba(196, 176, 154, 0.5);
+            }
+
+            .source-meta-label {
+                font-size: 0.82rem;
+                color: #7b6a58;
+                margin-bottom: 0.3rem;
+            }
+
+            .source-meta-value {
+                font-size: 0.98rem;
+                line-height: 1.45;
+                color: #203246;
+                word-break: break-word;
+            }
+
+            .source-detail-block {
+                padding: 0.95rem 1rem;
+                border-radius: 18px;
+                background: rgba(255, 255, 255, 0.72);
+                border: 1px solid rgba(196, 176, 154, 0.4);
+            }
+
+            .source-detail-title {
+                font-size: 0.92rem;
+                font-weight: 700;
+                color: #1f3550;
+                margin-bottom: 0.45rem;
+            }
+
+            .source-detail-body {
+                font-size: 0.96rem;
+                line-height: 1.75;
+                color: #32485d;
+                white-space: pre-wrap;
             }
         </style>
         """,

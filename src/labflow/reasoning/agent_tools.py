@@ -122,6 +122,9 @@ class ReasoningToolbox:
     ) -> ToolExecutionResult:
         params = action_input if isinstance(action_input, dict) else {}
         query = str(params.get("query", "")).strip() or context.paper_section.combined_text
+        semantic_index = self._evidence_builder.build_semantic_index_from_evidences(
+            context.code_evidences
+        )
         synthetic_section = PaperSection(
             title=context.paper_section.title,
             content=query,
@@ -129,11 +132,20 @@ class ReasoningToolbox:
             page_number=context.paper_section.page_number,
             order=context.paper_section.order,
         )
-        candidates = self._evidence_builder.build_alignment_candidates_from_inputs(
-            paper_sections=(synthetic_section,),
-            code_evidences=context.code_evidences,
+        candidates = self._evidence_builder.retrieve_semantic_candidates(
+            synthetic_section,
+            semantic_index,
             top_k=4,
         )
+        traced_candidates = self._evidence_builder.trace_related_candidates(
+            synthetic_section,
+            semantic_index,
+            trace_symbols=tuple(query.split()),
+            seen_candidate_ids={self._candidate_id(item) for item in candidates},
+            limit=2,
+        )
+        if traced_candidates:
+            candidates = tuple((*candidates, *traced_candidates))
         if not candidates:
             return ToolExecutionResult(
                 tool_name="llm_semantic_search",

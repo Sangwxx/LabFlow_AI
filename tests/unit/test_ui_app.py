@@ -1,12 +1,16 @@
 """工作区语义代码画布测试。"""
 
+from labflow.config.settings import Settings
 from labflow.reasoning.models import AlignmentResult, PaperSection
 from labflow.ui.app import (
     build_highlighted_code_html,
+    build_source_overview_html,
     get_selected_section,
     resolve_focus_section_index,
+    resolve_runtime_settings,
     should_render_source_grounding,
 )
+from labflow.ui.sidebar import SidebarState, _build_api_key_status
 
 
 def test_build_highlighted_code_html_marks_semantic_lines() -> None:
@@ -38,6 +42,37 @@ def test_build_highlighted_code_html_marks_semantic_lines() -> None:
     assert ">24<" in html
     assert ">26<" in html
     assert "rearrange" in html
+    assert html.startswith('<div class="semantic-code-shell">')
+
+
+def test_build_source_overview_html_contains_grounding_summary() -> None:
+    """源码定位概览卡应把文件、范围和说明收拢到同一个区域。"""
+
+    alignment_result = AlignmentResult(
+        paper_section_title="3.2 Graph Policy",
+        code_file_name="map_nav_src/models/vilmodel.py",
+        alignment_score=0.83,
+        match_type="strong_match",
+        analysis="译文",
+        semantic_evidence="重点",
+        research_supplement="术语",
+        implementation_chain="当前展示的源码片段来自 map_nav_src/models/vilmodel.py。",
+        operator_alignment="这段代码里有图注意力相关算子。",
+        shape_alignment="这里能看到图结构偏置被加到 attention mask 上。",
+        confidence_note="建议人工核对 global encoder 的上游调用。",
+        improvement_suggestion="",
+        retrieval_score=0.45,
+        code_snippet="graph_sprels = self.sprel_linear(x)",
+        code_start_line=365,
+        code_end_line=392,
+    )
+
+    html = build_source_overview_html(alignment_result)
+
+    assert "map_nav_src/models/vilmodel.py" in html
+    assert "L365-L392" in html
+    assert "源码片段来自" in html
+    assert "图结构偏置" in html
 
 
 def test_get_selected_section_supports_initial_silent_state() -> None:
@@ -90,8 +125,8 @@ def test_resolve_focus_section_index_supports_merged_block_orders() -> None:
     assert resolve_focus_section_index(sections, 99) is None
 
 
-def test_source_grounding_only_shows_for_strong_alignment() -> None:
-    """源码落地模块只应在强关联命中时展示。"""
+def test_source_grounding_shows_for_viable_grounding_result() -> None:
+    """只要拿到了可信源码解释，源码落地模块就应该展示。"""
 
     strong_result = AlignmentResult(
         paper_section_title="3.1 多头注意力",
@@ -107,6 +142,21 @@ def test_source_grounding_only_shows_for_strong_alignment() -> None:
         code_snippet="q = self.q_proj(x)",
         code_start_line=10,
         code_end_line=10,
+    )
+    partial_result = AlignmentResult(
+        paper_section_title="3.2 Graph Policy",
+        code_file_name="policy.py",
+        alignment_score=0.61,
+        match_type="partial_match",
+        analysis="译文",
+        semantic_evidence="重点",
+        research_supplement="术语",
+        implementation_chain="这段代码负责把局部观测和全局图信息拼起来后做导航决策。",
+        improvement_suggestion="",
+        retrieval_score=0.12,
+        code_snippet="state = fuse(local_obs, global_map)\nreturn policy_head(state)\n",
+        code_start_line=11,
+        code_end_line=12,
     )
     weak_result = AlignmentResult(
         paper_section_title="1 Introduction",
@@ -125,4 +175,67 @@ def test_source_grounding_only_shows_for_strong_alignment() -> None:
     )
 
     assert should_render_source_grounding(strong_result) is True
+    assert should_render_source_grounding(partial_result) is True
     assert should_render_source_grounding(weak_result) is False
+
+
+def test_resolve_runtime_settings_prefers_sidebar_overrides() -> None:
+    """侧边栏里手动覆盖的模型配置应该真正进入运行时。"""
+
+    base_settings = Settings(
+        app_env="dev",
+        api_key="env-key",
+        base_url="https://api.example.com/v1",
+        model_name="base-model",
+    )
+    sidebar_state = SidebarState(
+        uploaded_pdf_name=None,
+        uploaded_pdf_bytes=None,
+        git_repo_path=r"E:\VLN-DUET-main",
+        api_key="override-key",
+        base_url="https://override.example.com/v1",
+        model_name="override-model",
+    )
+
+    runtime_settings = resolve_runtime_settings(base_settings, sidebar_state)
+
+    assert runtime_settings.api_key == "override-key"
+    assert runtime_settings.base_url == "https://override.example.com/v1"
+    assert runtime_settings.model_name == "override-model"
+
+
+def test_resolve_runtime_settings_falls_back_to_env_key() -> None:
+    """如果侧边栏没有手动输入密钥，就继续使用环境变量配置。"""
+
+    base_settings = Settings(
+        app_env="dev",
+        api_key="env-key",
+        base_url="https://api.example.com/v1",
+        model_name="base-model",
+    )
+    sidebar_state = SidebarState(
+        uploaded_pdf_name=None,
+        uploaded_pdf_bytes=None,
+        git_repo_path="",
+        api_key=None,
+        base_url="https://api.example.com/v1",
+        model_name="base-model",
+    )
+
+    runtime_settings = resolve_runtime_settings(base_settings, sidebar_state)
+
+    assert runtime_settings.api_key == "env-key"
+
+
+def test_build_api_key_status_does_not_require_echoing_secret() -> None:
+    """状态提示只描述来源，不应该要求把真实密钥显示回页面。"""
+
+    assert (
+        _build_api_key_status(has_env_api_key=True, has_session_override=False)
+        == "已检测到 `.env` 中的 API Key，当前输入框不会回显真实值。"
+    )
+    assert (
+        _build_api_key_status(has_env_api_key=True, has_session_override=True)
+        == "当前会话已应用手动输入的 API Key，页面不会回显具体值。"
+    )
+    assert _build_api_key_status(has_env_api_key=False, has_session_override=False) is None
