@@ -3,7 +3,10 @@
 from labflow.config.settings import Settings
 from labflow.reasoning.models import AlignmentResult, PaperSection
 from labflow.ui.app import (
+    build_landing_entry_header_html,
+    build_landing_readiness_text,
     build_highlighted_code_html,
+    build_landing_hero_html,
     build_source_overview_html,
     get_selected_section,
     resolve_focus_section_index,
@@ -73,6 +76,42 @@ def test_build_source_overview_html_contains_grounding_summary() -> None:
     assert "L365-L392" in html
     assert "源码片段来自" in html
     assert "图结构偏置" in html
+
+
+def test_build_landing_entry_header_html_marks_ready_status() -> None:
+    """首页入口卡应该保留步骤、标题和精简状态。"""
+
+    html = build_landing_entry_header_html(
+        step_label="步骤 1",
+        title="上传论文 PDF",
+        description="上传后会抽取可点击段落。",
+        status_text="已就绪",
+        status_tone="ready",
+    )
+
+    assert "步骤 1" in html
+    assert "上传论文 PDF" in html
+    assert "已就绪" in html
+    assert "entry-card-state-ready" in html
+
+
+def test_build_landing_readiness_text_summarizes_missing_steps() -> None:
+    """首页提示语应直接说清当前还缺什么。"""
+
+    assert build_landing_readiness_text(has_pdf=False, has_repo_path=False) == "先完成这两项输入。"
+    assert build_landing_readiness_text(has_pdf=True, has_repo_path=False) == "还差代码目录。"
+    assert build_landing_readiness_text(has_pdf=False, has_repo_path=True) == "还差论文 PDF。"
+    assert build_landing_readiness_text(has_pdf=True, has_repo_path=True) == "已准备好，可以开始阅读。"
+
+
+def test_build_landing_hero_html_reflects_progress_state() -> None:
+    """首页顶部应保持克制，只展示品牌、标题、副标题和状态。"""
+
+    html = build_landing_hero_html(has_pdf=True, has_repo_path=False)
+
+    assert "论文与代码，对齐阅读" in html
+    assert "准备好 PDF 和代码目录后，直接进入工作区。" in html
+    assert "还差代码目录。" in html
 
 
 def test_get_selected_section_supports_initial_silent_state() -> None:

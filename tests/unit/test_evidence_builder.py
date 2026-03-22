@@ -317,6 +317,45 @@ def test_evidence_builder_builds_code_evidence_from_source_files() -> None:
     assert evidences[0].end_line >= evidences[0].start_line
 
 
+def test_evidence_builder_keeps_late_python_chunks_for_large_files() -> None:
+    """大文件切块不能只截前半段，否则后面的核心实现永远进不了索引。"""
+
+    function_blocks = []
+    for index in range(24):
+        function_blocks.append(
+            "\n".join(
+                (
+                    f"def fn_{index}(x):",
+                    f'    """chunk {index}"""',
+                    f"    return x + {index}",
+                    "",
+                )
+            )
+        )
+
+    repo_result = GitRepoParseResult(
+        repo_path="D:/repo",
+        branch_name="UNVERSIONED",
+        recent_commits=(),
+        working_tree_diff="",
+        source_files=(
+            SourceFile(
+                relative_path="large_module.py",
+                content="".join(function_blocks),
+            ),
+        ),
+        source_type="directory",
+    )
+
+    evidences = EvidenceBuilder().build_code_evidences(repo_result)
+    symbol_names = {evidence.symbol_name for evidence in evidences}
+
+    assert len(evidences) == 16
+    assert "fn_0" in symbol_names
+    assert "fn_12" in symbol_names
+    assert "fn_23" in symbol_names
+
+
 def test_evidence_builder_builds_semantic_index_from_evidences() -> None:
     """语义索引至少要把职责、定义符号和调用符号整理出来。"""
 

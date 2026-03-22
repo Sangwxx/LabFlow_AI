@@ -613,7 +613,7 @@ class EvidenceBuilder:
         source_file: SourceFile,
         *,
         repo_root: Path,
-        max_chunks_per_file: int = 12,
+        max_chunks_per_file: int = 16,
     ) -> list[CodeEvidence]:
         absolute_path = str((repo_root / source_file.relative_path).resolve())
         lines = source_file.content.splitlines()
@@ -676,10 +676,61 @@ class EvidenceBuilder:
                             node=child,
                             parent_symbol=node.name,
                         )
-            if len(chunks) >= max_chunks_per_file:
-                break
 
-        return chunks[:max_chunks_per_file]
+        return self._select_representative_python_chunks(
+            chunks,
+            max_chunks_per_file=max_chunks_per_file,
+        )
+
+    def _select_representative_python_chunks(
+        self,
+        chunks: list[CodeEvidence],
+        *,
+        max_chunks_per_file: int,
+    ) -> list[CodeEvidence]:
+        if len(chunks) <= max_chunks_per_file:
+            return chunks
+
+        ordered = sorted(chunks, key=lambda item: (item.start_line, item.end_line))
+        selected: list[CodeEvidence] = []
+        intro_chunk = next((item for item in ordered if item.symbol_name == "module_intro"), None)
+        if intro_chunk is not None:
+            selected.append(intro_chunk)
+
+        remaining = [item for item in ordered if item is not intro_chunk]
+        slots = max_chunks_per_file - len(selected)
+        if slots <= 0:
+            return selected[:max_chunks_per_file]
+        if len(remaining) <= slots:
+            return selected + remaining
+
+        selected_indexes: set[int] = set()
+        first_line = remaining[0].start_line
+        last_line = remaining[-1].start_line
+        span = max(1, last_line - first_line)
+
+        for slot_index in range(slots):
+            if slots == 1:
+                target_line = first_line
+            else:
+                target_line = first_line + span * slot_index / (slots - 1)
+
+            ranked_indexes = sorted(
+                range(len(remaining)),
+                key=lambda index: (
+                    abs(remaining[index].start_line - target_line),
+                    remaining[index].start_line,
+                    remaining[index].end_line - remaining[index].start_line,
+                ),
+            )
+            chosen_index = next(
+                (index for index in ranked_indexes if index not in selected_indexes),
+                ranked_indexes[0],
+            )
+            selected_indexes.add(chosen_index)
+
+        selected.extend(remaining[index] for index in sorted(selected_indexes))
+        return selected[:max_chunks_per_file]
 
     def _append_ast_node_evidence(
         self,

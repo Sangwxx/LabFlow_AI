@@ -52,13 +52,13 @@ class CodeGroundingAgent:
     ) -> AlignmentResult | None:
         semantic_index = self._evidence_builder.build_semantic_index_from_evidences(code_evidences)
         self._emit_semantic_cards(semantic_index, event_handler)
-        current_candidates = self._build_initial_candidates(
+        initial_candidates = self._build_initial_candidates(
             paper_section=paper_section,
             code_evidences=code_evidences,
             code_focus=plan.code_focus,
             semantic_index=semantic_index,
         )
-        if not current_candidates:
+        if not initial_candidates:
             self._emit(
                 event_handler,
                 kind="observation",
@@ -70,10 +70,16 @@ class CodeGroundingAgent:
             paper_section=paper_section,
             project_structure=project_structure,
             code_evidences=code_evidences,
-            current_candidates=current_candidates,
+            current_candidates=initial_candidates,
             role_prompt=role_prompt,
             event_handler=event_handler,
             max_runtime_sec=self.EXECUTION_BUDGET_SEC,
+        )
+        current_candidates = self._stabilize_candidates(
+            initial_candidates,
+            current_candidates,
+            paper_section=paper_section,
+            code_focus=plan.code_focus,
         )
         if (
             all(not trace.tool_invocations for trace in step_traces)
@@ -507,14 +513,44 @@ class CodeGroundingAgent:
         *,
         paper_section: PaperSection,
         code_focus: tuple[str, ...],
-    ) -> tuple[float, float]:
+    ) -> tuple[float, float, float]:
         return (
             self._compute_focus_alignment_score(
                 candidate.code_evidence,
                 paper_section=paper_section,
                 code_focus=code_focus,
             ),
+            self._compute_specificity_score(
+                candidate.code_evidence,
+                paper_section=paper_section,
+            ),
             candidate.retrieval_score,
+        )
+
+    def _stabilize_candidates(
+        self,
+        initial_candidates: tuple[AlignmentCandidate, ...],
+        latest_candidates: tuple[AlignmentCandidate, ...],
+        *,
+        paper_section: PaperSection,
+        code_focus: tuple[str, ...],
+    ) -> tuple[AlignmentCandidate, ...]:
+        merged: dict[str, AlignmentCandidate] = {}
+        for candidate in (*initial_candidates, *latest_candidates):
+            candidate_id = self._candidate_id(candidate)
+            existing = merged.get(candidate_id)
+            if existing is None or candidate.retrieval_score > existing.retrieval_score:
+                merged[candidate_id] = candidate
+        return tuple(
+            sorted(
+                merged.values(),
+                key=lambda item: self._candidate_sort_key(
+                    item,
+                    paper_section=paper_section,
+                    code_focus=code_focus,
+                ),
+                reverse=True,
+            )[:6]
         )
 
     def _compute_focus_alignment_score(
@@ -574,9 +610,52 @@ class CodeGroundingAgent:
             score -= 2.0
         if any(term in paper_text for term in ("encoder", "cross-modal", "coarse-scale")) and any(
             term in searchable
-            for term in ("rollout", "make_equiv_action", "/agent.py", "\\agent.py", "/env.py", "\\env.py")
+            for term in (
+                "rollout",
+                "make_equiv_action",
+                "/agent.py",
+                "\\agent.py",
+                "/env.py",
+                "\\env.py",
+                "/agent_",
+                "\\agent_",
+                "agent_obj",
+            )
         ):
             score -= 8.0
+        return score
+
+    def _compute_specificity_score(
+        self,
+        evidence: CodeEvidence,
+        *,
+        paper_section: PaperSection,
+    ) -> float:
+        file_name = evidence.file_name.lower()
+        paper_text = paper_section.combined_text.lower()
+        span = max(1, evidence.end_line - evidence.start_line + 1)
+        score = 0.0
+
+        if span <= 24:
+            score += 2.2
+        elif span <= 80:
+            score += 1.4
+        elif span <= 160:
+            score += 0.6
+        elif span >= 260:
+            score -= 1.6
+
+        if any(term in paper_text for term in ("encoder", "cross-modal", "coarse-scale")):
+            if "/models/" in file_name or file_name.startswith("models/"):
+                score += 1.8
+            if any(term in file_name for term in ("/agent", "\\agent", "/reverie/", "/r2r/")):
+                score -= 2.4
+
+        if any(term in paper_text for term in ("graph", "map", "global planning")) and any(
+            term in file_name for term in ("graph_utils", "vilmodel", "transformer")
+        ):
+            score += 1.0
+
         return score
 
     def _build_grounded_implementation_chain(

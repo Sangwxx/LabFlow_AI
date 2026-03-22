@@ -75,6 +75,19 @@ reasoning/
   - 右侧结果区改为 `导师讲解 / 源码定位 / 推理链路` tab
   - `源码定位` 改为“概览在上、代码整块铺开”的结构，避免代码被长导读挤到下方
   - 修复代码块 HTML 被当作原始文本输出的问题，代码行现在按真实代码渲染并自动换行
+  - 首页改为更紧凑的双卡片入口，隐藏首页侧边栏，避免数据输入与运行配置重复出现
+  - 继续做了一轮结构整理：首页视图拆到 `ui/landing.py`，样式拆到 `ui/styles.py`，`app.py` 已压回 500 行以内
+- 更新 [D:\Labflow\README.md]
+  - 改写为比赛交付导向的启动说明，明确评委快速启动方式、环境变量要求与 API Key 依赖
+- 新增 [D:\Labflow\run_labflow.py]
+  - 提供统一 Python 启动入口，缺少 `.env` 时自动复制模板
+- 新增 [D:\Labflow\start_labflow.bat]
+  - 提供 Windows 一键启动脚本，自动创建 `.venv`、安装依赖并启动页面
+- 新增 [D:\Labflow\Dockerfile] 与 [D:\Labflow\.dockerignore]
+  - 提供容器化运行入口，默认对外监听 `0.0.0.0:8501`
+  - README 已补充容器挂载本地代码目录的说明，避免评委把宿主机路径直接填进容器页面
+- 更新 [D:\Labflow\.env.example]
+  - 补充字段说明，降低评委首次配置门槛
 - 更新 [D:\Labflow\src\labflow\reasoning\code_grounding_agent.py]
   - 先看代码卡片，再做混合召回与调用链追踪
   - 为执行阶段增加运行时预算与兜底收束，避免真实联调时长期停在推理中
@@ -82,12 +95,16 @@ reasoning/
   - 最终源码说明强制锚定当前展示片段，避免“解释说的是 A，UI 显示的是 B”
 - 更新 [D:\Labflow\src\labflow\reasoning\agent_tools.py]
   - `llm_semantic_search` 改为基于本地代码卡片的语义召回
+- 更新 [D:\Labflow\src\labflow\reasoning\evidence_builder.py]
+  - Python 大文件切块不再只截文件头，改为保留分布式代表逻辑块，避免 `vilmodel.py` 后半段核心实现进不了索引
 - 更新 [D:\Labflow\tests\unit\test_evidence_builder.py]
   - 增加代码卡片语义召回测试
+  - 增加“大文件后半段逻辑块也要进入索引”的切块覆盖测试
 - 更新 [D:\Labflow\tests\unit\test_agent_runtime.py]
   - 增加“执行器只返回兜底动作时提前收束”和“达到预算时生成超时计划”的测试
 - 新增 [D:\Labflow\tests\unit\test_code_grounding_agent.py]
   - 增加图规划章节优先命中 `graph_utils.py` 与“解释必须锚定当前证据片段”的测试
+  - 增加“跨模态编码器应优先命中编码层而不是图路径工具函数”的排序测试
 - 更新 [D:\Labflow\tests\unit\test_ui_app.py]
   - 增加源码概览卡与代码 HTML 输出格式测试
 
@@ -104,6 +121,9 @@ reasoning/
 - 后续在 `http://127.0.0.1:8513` 继续联调同一段落时，源码定位已能稳定落到 `map_nav_src/models/graph_utils.py · L95-L168`，并且右侧结果区切成 tab 后，代码不再需要滚到很下方才能看到
 - 修复代码块 HTML 渲染错误后，`源码定位` 页签不再把 `<div>/<span>` 原样打印到页面，代码行可正常查看
 - 最新在 `http://127.0.0.1:8515` 用最终版布局复测时，界面已经切到“概览在上、代码整块铺开”的结构，但源码命中结果又漂到了 `map_nav_src/reverie/agent_obj.py · L30-L498`
+- 进一步排查后确认根因之一是 `build_code_evidences()` 对 Python 文件默认只保留前 12 个逻辑块，导致 `map_nav_src/models/vilmodel.py` 后半段的 `GraphLXRTXLayer.forward / GlobalMapEncoder / forward_navigation_per_step` 长期缺席候选池
+- 修复切块策略后，在新的 `http://127.0.0.1:8517` Playwright 复测里，同一段 `3.2.2 Coarse-scale Cross-modal Encoder` 的 `源码定位` 已稳定落到 `map_nav_src/models/vilmodel.py · L383-L398`，展示片段为 `GraphLXRTXLayer.forward`
+- 后续在 `http://127.0.0.1:8520` 复测首页时，左侧重复侧边栏已移除，首页改为居中的双卡片入口，按钮与标题层级也更克制
 - 结论：UI 可读性问题已基本收口，但代码对齐结果对同一论文段落仍存在跨轮次波动，下一轮需要继续压制 `agent / rollout / action` 这类泛化候选的回流
 
 ## 后续关注点

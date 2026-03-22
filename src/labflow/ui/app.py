@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from html import escape
-
 import streamlit as st
 
 from labflow.clients.llm_client import LLMClient
@@ -14,11 +13,30 @@ from labflow.parsers.pdf_parser import PDFParser, PDFParseResult
 from labflow.reasoning.agent_executor import PlanAndExecuteAgent
 from labflow.reasoning.evidence_builder import EvidenceBuilder
 from labflow.reasoning.models import AlignmentResult, CodeEvidence, PaperSection
+from labflow.ui.landing import (
+    build_landing_entry_header_html,
+    build_landing_hero_html,
+    build_landing_readiness_text,
+    render_landing,
+)
 from labflow.ui.pdf_viewer import render_pdf_viewer
 from labflow.ui.sidebar import SidebarState, render_sidebar
+from labflow.ui.styles import inject_styles
 
 EVIDENCE_BUILDER = EvidenceBuilder()
 ALIGNMENT_CACHE_VERSION = "learning-output-v14"
+__all__ = [
+    "build_highlighted_code_html",
+    "build_landing_entry_header_html",
+    "build_landing_hero_html",
+    "build_landing_readiness_text",
+    "build_source_overview_html",
+    "get_selected_section",
+    "resolve_focus_section_index",
+    "resolve_runtime_settings",
+    "run",
+    "should_render_source_grounding",
+]
 
 
 @dataclass(frozen=True)
@@ -44,11 +62,11 @@ def run() -> None:
     init_session_state()
     inject_styles()
 
-    sidebar_state = render_sidebar(settings)
+    current_route = st.session_state["current_route"]
+    sidebar_state = get_sidebar_state(settings=settings, current_route=current_route)
     runtime_settings = resolve_runtime_settings(settings, sidebar_state)
-    sync_sidebar_overrides(sidebar_state)
 
-    if st.session_state["current_route"] == "workspace":
+    if current_route == "workspace":
         render_workspace(runtime_settings)
     else:
         render_landing()
@@ -71,66 +89,21 @@ def get_alignment_agent(settings: Settings) -> PlanAndExecuteAgent:
     return PlanAndExecuteAgent(llm_client=LLMClient(settings=settings))
 
 
-def render_landing() -> None:
-    st.markdown(
-        """
-        <div class="landing-shell">
-            <div class="landing-kicker">LabFlow 知云版</div>
-            <div class="landing-title">先进入工作区，再开始阅读与对齐</div>
-            <div class="landing-body">
-                这里只做两件事：接住你的论文 PDF，接住你的本地代码路径。
-                进入工作区后，主界面会彻底切换为沉浸式阅读视图。
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
+def get_sidebar_state(settings: Settings, current_route: str) -> SidebarState:
+    """首页不展示侧边栏，工作区再启用完整运行配置。"""
+
+    if current_route == "workspace":
+        sidebar_state = render_sidebar(settings)
+        sync_sidebar_overrides(sidebar_state)
+        return sidebar_state
+    return SidebarState(
+        uploaded_pdf_name=st.session_state.get("sidebar_uploaded_pdf_name"),
+        uploaded_pdf_bytes=st.session_state.get("sidebar_uploaded_pdf_bytes"),
+        git_repo_path=st.session_state.get("sidebar_git_repo_path", ""),
+        api_key=st.session_state.get("sidebar_api_key") or None,
+        base_url=st.session_state.get("sidebar_base_url", settings.base_url),
+        model_name=st.session_state.get("sidebar_model_name", settings.model_name),
     )
-
-    pdf_column, git_column = st.columns(2, gap="large")
-    with pdf_column:
-        st.markdown('<div class="entry-card">', unsafe_allow_html=True)
-        st.markdown("### 上传论文 PDF")
-        st.caption("支持直接读取浏览器上传后的内存字节流。")
-        uploaded_pdf = st.file_uploader(
-            "选择 PDF",
-            type=["pdf"],
-            key="landing_pdf_uploader",
-            label_visibility="collapsed",
-        )
-        st.markdown("</div>", unsafe_allow_html=True)
-
-    with git_column:
-        st.markdown('<div class="entry-card">', unsafe_allow_html=True)
-        st.markdown("### 输入代码路径")
-        st.caption("支持真实 Git 仓库，也支持 GitHub Zip 解压后的普通 Python 目录。")
-        git_repo_path = st.text_area(
-            "代码路径",
-            value=st.session_state.get("landing_git_repo_path", ""),
-            placeholder=r"E:\project\your-repo",
-            height=190,
-            key="landing_git_repo_path_input",
-            label_visibility="collapsed",
-        ).strip()
-        st.markdown("</div>", unsafe_allow_html=True)
-
-    if uploaded_pdf is not None:
-        st.session_state["landing_pdf_bytes"] = uploaded_pdf.getvalue()
-        st.session_state["landing_pdf_name"] = uploaded_pdf.name
-    st.session_state["landing_git_repo_path"] = git_repo_path
-
-    _, middle, _ = st.columns([1, 1.35, 1])
-    with middle:
-        if st.button("进入工作区", type="primary", use_container_width=True):
-            if not st.session_state.get("landing_pdf_bytes"):
-                st.warning("先上传论文 PDF，再进入工作区。")
-                return
-            if not st.session_state.get("landing_git_repo_path"):
-                st.warning("先填写本地代码路径，再进入工作区。")
-                return
-            st.session_state["current_route"] = "workspace"
-            st.session_state["selected_section_index"] = None
-            st.session_state["pdf_hotspot_viewer"] = None
-            st.rerun()
 
 
 def render_workspace(runtime_settings: Settings) -> None:
@@ -624,224 +597,3 @@ def sync_sidebar_overrides(sidebar_state: SidebarState) -> None:
         st.session_state["sidebar_uploaded_pdf_name"] = sidebar_state.uploaded_pdf_name
     if sidebar_state.git_repo_path:
         st.session_state["sidebar_git_repo_path"] = sidebar_state.git_repo_path
-
-
-def inject_styles() -> None:
-    st.markdown(
-        """
-        <style>
-            html, body, [class*="css"] {
-                font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
-            }
-
-            #MainMenu,
-            footer,
-            header[data-testid="stHeader"],
-            div[data-testid="stDecoration"] {
-                visibility: hidden;
-                height: 0;
-            }
-
-            .stApp {
-                background:
-                    radial-gradient(
-                        circle at top right,
-                        rgba(255, 201, 142, 0.16),
-                        transparent 24%
-                    ),
-                    radial-gradient(
-                        circle at left 28%,
-                        rgba(38, 147, 125, 0.12),
-                        transparent 22%
-                    ),
-                    linear-gradient(180deg, #f8f4ec 0%, #f1ece2 100%);
-            }
-
-            .block-container {
-                padding-top: 1rem;
-                padding-bottom: 0rem;
-                padding-left: 1rem;
-                padding-right: 1rem;
-                max-width: 98vw;
-            }
-
-            div[data-testid="column"] {
-                width: 100% !important;
-            }
-
-            .landing-shell {
-                max-width: 60rem;
-                margin: 6rem auto 2rem auto;
-                text-align: center;
-            }
-
-            .landing-kicker {
-                font-size: 0.88rem;
-                letter-spacing: 0.12em;
-                text-transform: uppercase;
-                color: #8f7358;
-                margin-bottom: 0.8rem;
-            }
-
-            .landing-title {
-                font-size: 3rem;
-                line-height: 1.1;
-                font-weight: 700;
-                color: #1a2b3d;
-                margin-bottom: 0.9rem;
-            }
-
-            .landing-body {
-                font-size: 1.05rem;
-                line-height: 1.9;
-                color: #415668;
-                margin-bottom: 2rem;
-            }
-
-            .entry-card {
-                min-height: 15rem;
-                padding: 1.4rem;
-                border-radius: 24px;
-                background: rgba(255, 255, 255, 0.78);
-                box-shadow: 0 20px 40px rgba(28, 46, 66, 0.10);
-            }
-
-            .workspace-title {
-                font-size: 2.4rem;
-                font-weight: 700;
-                color: #1a2b3d;
-            }
-
-            .section-focus-bar {
-                display: flex;
-                align-items: center;
-                gap: 0.75rem;
-                min-height: 3.25rem;
-                padding: 0.75rem 0.95rem;
-                margin: 0 0 0.65rem 0;
-                border-radius: 18px;
-                background: rgba(239, 241, 246, 0.92);
-                border: 1px solid rgba(34, 47, 62, 0.08);
-            }
-
-            .section-focus-page {
-                flex: 0 0 auto;
-                padding: 0.2rem 0.6rem;
-                border-radius: 999px;
-                background: rgba(31, 43, 61, 0.08);
-                color: #1a2b3d;
-                font-weight: 600;
-                font-size: 0.92rem;
-            }
-
-            .section-focus-title {
-                color: #2f4052;
-                font-size: 1rem;
-                font-weight: 500;
-                line-height: 1.4;
-            }
-
-            .semantic-code-shell {
-                border-radius: 22px;
-                overflow: hidden;
-                background: rgba(255, 255, 255, 0.82);
-                border: 1px solid rgba(196, 176, 154, 0.6);
-            }
-
-            .semantic-code-header {
-                padding: 0.85rem 1rem;
-                background: rgba(235, 241, 247, 0.92);
-                color: #1f3550;
-                font-weight: 600;
-            }
-
-            .semantic-code-body {
-                padding: 0.75rem 0;
-                overflow-x: auto;
-                overflow-y: auto;
-                white-space: pre-wrap;
-            }
-
-            .code-line {
-                display: grid;
-                grid-template-columns: 4.5rem minmax(0, 1fr);
-                gap: 0.75rem;
-                padding: 0.12rem 1rem;
-                font-family: "Source Code Pro", "Consolas", monospace;
-                font-size: 0.92rem;
-                line-height: 1.2;
-                align-items: start;
-            }
-
-            .code-line-highlight {
-                background: rgba(255, 238, 186, 0.66);
-            }
-
-            .code-line-number {
-                color: #8b97a6;
-                text-align: right;
-                user-select: none;
-            }
-
-            .code-line-content {
-                color: #10253c;
-                white-space: pre-wrap;
-                word-break: break-word;
-                overflow-wrap: anywhere;
-            }
-
-            .source-overview-shell {
-                display: grid;
-                gap: 0.9rem;
-            }
-
-            .source-meta-grid {
-                display: grid;
-                grid-template-columns: repeat(2, minmax(0, 1fr));
-                gap: 0.75rem;
-            }
-
-            .source-meta-card {
-                padding: 0.85rem 0.95rem;
-                border-radius: 18px;
-                background: rgba(255, 255, 255, 0.78);
-                border: 1px solid rgba(196, 176, 154, 0.5);
-            }
-
-            .source-meta-label {
-                font-size: 0.82rem;
-                color: #7b6a58;
-                margin-bottom: 0.3rem;
-            }
-
-            .source-meta-value {
-                font-size: 0.98rem;
-                line-height: 1.45;
-                color: #203246;
-                word-break: break-word;
-            }
-
-            .source-detail-block {
-                padding: 0.95rem 1rem;
-                border-radius: 18px;
-                background: rgba(255, 255, 255, 0.72);
-                border: 1px solid rgba(196, 176, 154, 0.4);
-            }
-
-            .source-detail-title {
-                font-size: 0.92rem;
-                font-weight: 700;
-                color: #1f3550;
-                margin-bottom: 0.45rem;
-            }
-
-            .source-detail-body {
-                font-size: 0.96rem;
-                line-height: 1.75;
-                color: #32485d;
-                white-space: pre-wrap;
-            }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
