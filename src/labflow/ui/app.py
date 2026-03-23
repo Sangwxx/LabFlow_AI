@@ -4,10 +4,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from html import escape
+from pathlib import Path
 
 import streamlit as st
 
 from labflow.clients.llm_client import LLMClient
+from labflow.clients.semantic_scholar_client import SemanticScholarClient
 from labflow.config.settings import Settings, get_settings
 from labflow.parsers.git_repo_parser import GitRepoParser, GitRepoParseResult
 from labflow.parsers.pdf_parser import PDFParser, PDFParseResult
@@ -16,12 +18,16 @@ from labflow.reasoning.evidence_builder import EvidenceBuilder
 from labflow.reasoning.models import AlignmentResult, CodeEvidence, PaperSection
 from labflow.reporting import ReadingNoteEntry, ReportGenerator
 from labflow.ui.landing import (
+    LandingPaperPreviewState,
+    LandingRepoPreviewState,
     build_landing_entry_header_html,
     build_landing_hero_html,
     build_landing_readiness_text,
     render_landing,
 )
+from labflow.ui.paper_preview import LandingPaperPreview, build_landing_paper_preview
 from labflow.ui.pdf_viewer import render_pdf_viewer
+from labflow.ui.repo_preview import LandingRepoPreview, build_landing_repo_preview
 from labflow.ui.sidebar import SidebarState, render_sidebar
 from labflow.ui.styles import inject_styles
 
@@ -29,6 +35,8 @@ EVIDENCE_BUILDER = EvidenceBuilder()
 REPORT_GENERATOR = ReportGenerator()
 ALIGNMENT_CACHE_VERSION = "learning-output-v23"
 __all__ = [
+    "build_landing_paper_preview_state",
+    "build_landing_repo_preview_state",
     "build_landing_entry_header_html",
     "build_landing_hero_html",
     "build_landing_readiness_text",
@@ -71,7 +79,10 @@ def run() -> None:
     if current_route == "workspace":
         render_workspace(runtime_settings)
     else:
-        render_landing()
+        render_landing(
+            paper_preview_resolver=build_landing_paper_preview_state,
+            repo_preview_resolver=build_landing_repo_preview_state,
+        )
 
 
 def init_session_state() -> None:
@@ -86,6 +97,46 @@ def init_session_state() -> None:
     st.session_state.setdefault("semantic_alignment_cache", {})
     st.session_state.setdefault("reading_note_history", {})
     st.session_state.setdefault("reading_note_markdown", "")
+
+
+def build_landing_repo_preview_state(repo_path: str) -> LandingRepoPreviewState:
+    """首页只在路径有效时展示轻量目录预览，避免输入过程中出现噪声。"""
+
+    normalized_path = repo_path.strip()
+    if not normalized_path:
+        return LandingRepoPreviewState()
+
+    path_obj = Path(normalized_path).expanduser()
+    if not path_obj.exists():
+        return LandingRepoPreviewState(hint="输入有效目录后，这里会显示项目结构预览。")
+    if not path_obj.is_dir():
+        return LandingRepoPreviewState(hint="当前路径不是目录，暂时无法预览代码结构。")
+
+    try:
+        preview = load_landing_repo_preview(str(path_obj))
+    except (FileNotFoundError, ValueError):
+        return LandingRepoPreviewState(hint="当前目录暂时无法解析，稍后可直接进入工作区再继续。")
+    if preview is None:
+        return LandingRepoPreviewState(hint="当前目录里还没有可预览的源码文件。")
+    return LandingRepoPreviewState(preview=preview)
+
+
+def build_landing_paper_preview_state(
+    pdf_bytes: bytes | None,
+    source_name: str | None,
+) -> LandingPaperPreviewState:
+    """首页论文信息卡优先依赖本地解析，外部元数据只做补充。"""
+
+    if not pdf_bytes or not source_name:
+        return LandingPaperPreviewState()
+
+    try:
+        preview = load_landing_paper_preview(pdf_bytes, source_name)
+    except (RuntimeError, ValueError):
+        return LandingPaperPreviewState(hint="论文已上传，进入工作区后仍可继续阅读。")
+    if preview is None:
+        return LandingPaperPreviewState(hint="已上传论文，暂时还没识别出稳定的标题信息。")
+    return LandingPaperPreviewState(preview=preview)
 
 
 @st.cache_resource(show_spinner=False)
@@ -259,6 +310,34 @@ def load_pdf_result(pdf_bytes: bytes, source_name: str) -> PDFParseResult:
 @st.cache_data(show_spinner=False)
 def load_repo_result(repo_path: str) -> GitRepoParseResult:
     return GitRepoParser().parse(repo_path)
+
+
+@st.cache_data(show_spinner=False)
+def load_landing_repo_preview(repo_path: str) -> LandingRepoPreview | None:
+    repo_result = load_repo_result(repo_path)
+    return build_landing_repo_preview(
+        relative_paths=tuple(source_file.relative_path for source_file in repo_result.source_files),
+        source_type=repo_result.source_type,
+        branch_name=repo_result.branch_name,
+    )
+
+
+@st.cache_data(show_spinner=False)
+def load_landing_paper_preview(
+    pdf_bytes: bytes,
+    source_name: str,
+) -> LandingPaperPreview | None:
+    pdf_result = load_pdf_result(pdf_bytes, source_name)
+    local_preview = build_landing_paper_preview(pdf_result=pdf_result, source_name=source_name)
+    if local_preview is None:
+        return None
+
+    semantic_paper = SemanticScholarClient().search_by_title(local_preview.title)
+    return build_landing_paper_preview(
+        pdf_result=pdf_result,
+        source_name=source_name,
+        semantic_paper=semantic_paper,
+    )
 
 
 @st.cache_data(show_spinner=False)

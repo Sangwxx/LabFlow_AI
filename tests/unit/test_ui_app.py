@@ -8,7 +8,9 @@ from labflow.reasoning.models import AlignmentResult, PaperSection, SourceGuideI
 from labflow.ui.app import (
     build_landing_entry_header_html,
     build_landing_hero_html,
+    build_landing_paper_preview_state,
     build_landing_readiness_text,
+    build_landing_repo_preview_state,
     build_reading_note_project_overview,
     build_source_overview_html,
     generate_reading_note_markdown,
@@ -19,6 +21,7 @@ from labflow.ui.app import (
     resolve_runtime_settings,
     should_render_source_grounding,
 )
+from labflow.ui.repo_preview import build_landing_repo_preview, build_repo_preview_html
 from labflow.ui.sidebar import SidebarState, _build_api_key_status
 
 
@@ -273,6 +276,74 @@ def test_build_landing_hero_html_reflects_progress_state() -> None:
     assert "论文与代码，对齐阅读" in html
     assert "准备好 PDF 和代码目录后，直接进入工作区。" in html
     assert "还差代码目录。" in html
+
+
+def test_build_landing_repo_preview_groups_root_directories() -> None:
+    """首页目录预览应按根目录聚合，并只展示轻量子项。"""
+
+    preview = build_landing_repo_preview(
+        relative_paths=(
+            "map_nav_src/models/vilmodel.py",
+            "map_nav_src/models/graph_utils.py",
+            "map_nav_src/reverie/agent_obj.py",
+            "pretrain_src/model/pretrain_cmt.py",
+            "run.py",
+        ),
+        source_type="git",
+        branch_name="main",
+    )
+
+    assert preview is not None
+    assert preview.source_label == "Git 仓库预览 · main"
+    assert preview.groups[0].root_name == "map_nav_src"
+    assert preview.groups[0].file_count == 3
+    assert preview.groups[0].children == ("models/", "reverie/")
+    assert any(group.root_name == "根目录" for group in preview.groups)
+
+
+def test_build_repo_preview_html_contains_grouped_structure() -> None:
+    """首页目录预览 HTML 应保留分组标题与子项标签。"""
+
+    preview = build_landing_repo_preview(
+        relative_paths=(
+            "map_nav_src/models/vilmodel.py",
+            "map_nav_src/reverie/agent_obj.py",
+        ),
+        source_type="directory",
+        branch_name="UNVERSIONED",
+    )
+
+    assert preview is not None
+    html = build_repo_preview_html(preview)
+
+    assert "代码目录预览" in html
+    assert "map_nav_src" in html
+    assert "models/" in html
+    assert "reverie/" in html
+    assert "文件" in html
+
+
+def test_build_landing_repo_preview_state_returns_hint_for_missing_path() -> None:
+    """路径无效时首页只给简短提示，不应该直接抛错。"""
+
+    state = build_landing_repo_preview_state(r"E:\definitely-missing-path-for-labflow")
+
+    assert state.preview is None
+    assert state.hint == "输入有效目录后，这里会显示项目结构预览。"
+
+
+def test_build_landing_paper_preview_state_handles_parser_failure(monkeypatch) -> None:
+    """首页论文信息卡失败时应降级为简短提示，不影响上传入口。"""
+
+    def _raise_preview_error(_pdf_bytes: bytes, _source_name: str):
+        raise ValueError("preview failed")
+
+    monkeypatch.setattr(app_module, "load_landing_paper_preview", _raise_preview_error)
+
+    state = build_landing_paper_preview_state(b"%PDF-1.4", "demo.pdf")
+
+    assert state.preview is None
+    assert state.hint == "论文已上传，进入工作区后仍可继续阅读。"
 
 
 def test_get_selected_section_supports_initial_silent_state() -> None:

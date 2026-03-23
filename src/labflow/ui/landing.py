@@ -2,12 +2,38 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from dataclasses import dataclass
 from html import escape
 
 import streamlit as st
 
+from labflow.ui.paper_preview import LandingPaperPreview, build_paper_preview_html
+from labflow.ui.repo_preview import LandingRepoPreview, build_repo_preview_html
 
-def render_landing() -> None:
+
+@dataclass(frozen=True)
+class LandingPaperPreviewState:
+    """首页论文信息卡的运行时状态。"""
+
+    preview: LandingPaperPreview | None = None
+    hint: str | None = None
+
+
+@dataclass(frozen=True)
+class LandingRepoPreviewState:
+    """首页代码目录预览的运行时状态。"""
+
+    preview: LandingRepoPreview | None = None
+    hint: str | None = None
+
+
+def render_landing(
+    *,
+    paper_preview_resolver: Callable[[bytes | None, str | None], LandingPaperPreviewState]
+    | None = None,
+    repo_preview_resolver: Callable[[str], LandingRepoPreviewState] | None = None,
+) -> None:
     has_pdf = bool(st.session_state.get("landing_pdf_bytes"))
     has_repo_path = bool(st.session_state.get("landing_git_repo_path", "").strip())
     _, content_column, _ = st.columns([0.7, 4.6, 0.7])
@@ -18,8 +44,16 @@ def render_landing() -> None:
         )
 
         pdf_column, git_column = st.columns(2, gap="medium")
-        uploaded_pdf = _render_pdf_input_card(pdf_column, has_pdf=has_pdf)
-        git_repo_path = _render_repo_input_card(git_column, has_repo_path=has_repo_path)
+        uploaded_pdf = _render_pdf_input_card(
+            pdf_column,
+            has_pdf=has_pdf,
+            paper_preview_resolver=paper_preview_resolver,
+        )
+        git_repo_path = _render_repo_input_card(
+            git_column,
+            has_repo_path=has_repo_path,
+            repo_preview_resolver=repo_preview_resolver,
+        )
 
         if uploaded_pdf is not None:
             st.session_state["landing_pdf_bytes"] = uploaded_pdf.getvalue()
@@ -29,7 +63,12 @@ def render_landing() -> None:
         _render_landing_action(has_pdf=has_pdf, has_repo_path=has_repo_path)
 
 
-def _render_pdf_input_card(column, *, has_pdf: bool):
+def _render_pdf_input_card(
+    column,
+    *,
+    has_pdf: bool,
+    paper_preview_resolver: Callable[[bytes | None, str | None], LandingPaperPreviewState] | None,
+):
     with column:
         with st.container(border=True):
             st.markdown(
@@ -55,10 +94,32 @@ def _render_pdf_input_card(column, *, has_pdf: bool):
             )
             if current_pdf_name:
                 st.caption(f"当前文件：`{current_pdf_name}`")
+            current_pdf_bytes = (
+                uploaded_pdf.getvalue()
+                if uploaded_pdf is not None
+                else st.session_state.get("landing_pdf_bytes")
+            )
+            paper_preview_state = (
+                paper_preview_resolver(current_pdf_bytes, current_pdf_name)
+                if paper_preview_resolver is not None
+                else LandingPaperPreviewState()
+            )
+            if paper_preview_state.preview is not None:
+                st.markdown(
+                    build_paper_preview_html(paper_preview_state.preview),
+                    unsafe_allow_html=True,
+                )
+            elif paper_preview_state.hint:
+                st.caption(paper_preview_state.hint)
     return uploaded_pdf
 
 
-def _render_repo_input_card(column, *, has_repo_path: bool) -> str:
+def _render_repo_input_card(
+    column,
+    *,
+    has_repo_path: bool,
+    repo_preview_resolver: Callable[[str], LandingRepoPreviewState] | None,
+) -> str:
     with column:
         with st.container(border=True):
             st.markdown(
@@ -79,6 +140,18 @@ def _render_repo_input_card(column, *, has_repo_path: bool) -> str:
                 label_visibility="collapsed",
             ).strip()
             st.caption("例如：`E:\\VLN-DUET-main`")
+            repo_preview_state = (
+                repo_preview_resolver(git_repo_path)
+                if repo_preview_resolver is not None
+                else LandingRepoPreviewState()
+            )
+            if repo_preview_state.preview is not None:
+                st.markdown(
+                    build_repo_preview_html(repo_preview_state.preview),
+                    unsafe_allow_html=True,
+                )
+            elif repo_preview_state.hint:
+                st.caption(repo_preview_state.hint)
     return git_repo_path
 
 
