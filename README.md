@@ -159,6 +159,20 @@ docker run --rm -p 8501:8501 --env-file .env -v E:\Projects:/workspace/repos lab
 5. 在左侧点击论文段落
 6. 在右侧查看导读结果、术语解释、源码定位与推理链路
 
+## 演示样例
+
+为了方便比赛评委快速复现，我们在仓库里额外放了一套固定演示样例：
+
+- `demo_assets/paper/Think.pdf`
+- `demo_assets/code/VLN-DUET-main/`
+
+其中：
+
+- `demo_assets/paper/Think.pdf` 是测试用论文
+- `demo_assets/code/VLN-DUET-main/` 是对应的代码项目快照，不包含原始 `.git` 历史
+
+如果你只是想先看项目怎么展示，直接用这套样例即可。
+
 ## 目录结构
 
 ```text
@@ -166,6 +180,12 @@ docker run --rm -p 8501:8501 --env-file .env -v E:\Projects:/workspace/repos lab
 ├── app.py
 ├── run_labflow.py
 ├── start_labflow.bat
+├── demo_assets/
+│   ├── README.md
+│   ├── paper/
+│   │   └── Think.pdf
+│   └── code/
+│       └── VLN-DUET-main/
 ├── src/
 │   └── labflow/
 │       ├── clients/
