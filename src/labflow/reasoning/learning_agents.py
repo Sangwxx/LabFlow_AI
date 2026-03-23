@@ -231,6 +231,39 @@ class ReadingAgent:
             kind="observation",
             message="中文译文阶段完成。",
         )
+        packet = self._generate_learning_packet(
+            paper_section,
+            translation=clean_translation,
+        )
+        if packet is not None:
+            core_points, glossary = packet
+            self._emit(
+                event_handler,
+                kind="action",
+                message="summarize_and_build_glossary",
+                action_input={"agent": "reading"},
+            )
+            self._emit(
+                event_handler,
+                kind="thought",
+                message="我一次性整理核心要点和术语解释，减少不必要的往返调用。",
+            )
+            self._emit(
+                event_handler,
+                kind="observation",
+                message="核心要点提炼完成。",
+            )
+            self._emit(
+                event_handler,
+                kind="observation",
+                message="术语百科整理完成。",
+            )
+            return LearningOutputs(
+                translation=clean_translation,
+                core_points=core_points,
+                glossary=glossary,
+            )
+
         self._emit(
             event_handler,
             kind="action",
@@ -279,6 +312,67 @@ class ReadingAgent:
             core_points=core_points,
             glossary=glossary,
         )
+
+    def _generate_learning_packet(
+        self,
+        paper_section: PaperSection,
+        *,
+        translation: str,
+    ) -> tuple[str, str] | None:
+        try:
+            payload = self._llm_client.generate_json(
+                system_prompt=self._build_learning_packet_system_prompt(),
+                user_prompt=(
+                    f"【论文片段原文】\n{paper_section.content}\n\n【中文译文】\n{translation}"
+                ),
+                temperature=0.1,
+                max_tokens=1300,
+            )
+        except Exception:  # noqa: BLE001
+            payload = None
+        if not isinstance(payload, dict):
+            return None
+
+        core_points = self._normalize_learning_packet_field(
+            payload.get("core_points", payload.get("semantic_evidence", "")),
+            paper_section=paper_section,
+            kind="core_points",
+        )
+        glossary = self._normalize_learning_packet_field(
+            payload.get("glossary", payload.get("research_supplement", "")),
+            paper_section=paper_section,
+            kind="glossary",
+        )
+        if core_points.count("- ") < 3 or glossary.count("- ") < 2:
+            return None
+        return core_points, glossary
+
+    def _build_learning_packet_system_prompt(self) -> str:
+        return (
+            "你是科研论文阅读助手。"
+            "请同时输出这段论文的核心要点和术语解释，减少多轮往返。"
+            "只返回 JSON 对象，字段包括："
+            "`core_points`（3 条中文要点列表），"
+            "`glossary`（2-3 条中文术语解释列表）。"
+        )
+
+    def _normalize_learning_packet_field(
+        self,
+        value: object,
+        *,
+        paper_section: PaperSection,
+        kind: str,
+    ) -> str:
+        if isinstance(value, list):
+            items = [str(item).strip() for item in value if str(item).strip()]
+            if kind == "core_points" and len(items) >= 3:
+                return self._format_bullets(items[:3])
+            if kind == "glossary" and len(items) >= 2:
+                return self._format_bullets(items[:3])
+        text_value = str(value).strip()
+        if kind == "core_points":
+            return self.normalize_core_points_text(text_value, paper_section)
+        return self.normalize_glossary_text(text_value, paper_section)
 
     def normalize_core_points_text(self, raw_text: str, paper_section: PaperSection) -> str:
         parsed = self._try_parse_structured_text(raw_text)

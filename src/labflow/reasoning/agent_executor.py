@@ -18,6 +18,7 @@ from labflow.reasoning.agent_engine import (
 )
 from labflow.reasoning.agent_tools import ReasoningToolbox
 from labflow.reasoning.code_grounding_agent import CodeGroundingAgent
+from labflow.reasoning.code_knowledge_index import CodeKnowledgeIndex
 from labflow.reasoning.evidence_builder import EvidenceBuilder
 from labflow.reasoning.learning_agents import ReadingAgent, TranslationAgent
 from labflow.reasoning.models import (
@@ -46,7 +47,11 @@ class PlanAndExecuteExecutor(RuntimeExecutor):
         super().__init__(
             llm_client,
             evidence_builder,
-            tool_registry=tool_registry or ReasoningToolbox(evidence_builder).build_registry(),
+            tool_registry=tool_registry
+            or ReasoningToolbox(
+                evidence_builder,
+                llm_client,
+            ).build_registry(),
         )
 
     def list_project_structure(self, project_structure: str) -> str:
@@ -82,10 +87,18 @@ class PlanAndExecuteExecutor(RuntimeExecutor):
             page_number=paper_section.page_number,
             order=paper_section.order,
         )
-        candidates = self._evidence_builder.build_alignment_candidates_from_inputs(
-            paper_sections=(synthetic_section,),
-            code_evidences=code_evidences,
-            top_k=max(2, top_k),
+        semantic_index = self._evidence_builder.build_semantic_index_from_evidences(
+            code_evidences,
+            llm_client=self._llm_client,
+        )
+        candidates = CodeKnowledgeIndex(
+            semantic_index,
+            llm_client=self._llm_client,
+        ).search(
+            synthetic_section,
+            focus_terms=tuple(query.split()),
+            top_k=max(4, top_k),
+            use_llm_rerank=False,
         )
         if not candidates:
             return "语义搜索没有找到相关代码。", ()
@@ -150,7 +163,10 @@ class PlanAndExecuteAgent:
     def __init__(self, llm_client=None, evidence_builder: EvidenceBuilder | None = None) -> None:
         self._llm_client = llm_client or LLMClient()
         self._evidence_builder = evidence_builder or EvidenceBuilder()
-        self._tool_registry = ReasoningToolbox(self._evidence_builder).build_registry()
+        self._tool_registry = ReasoningToolbox(
+            self._evidence_builder,
+            self._llm_client,
+        ).build_registry()
         self.planner = RuntimePlanner(self._llm_client)
         self.executor = RuntimeExecutor(
             self._llm_client,
@@ -383,6 +399,8 @@ class PlanAndExecuteAgent:
             needs_manual_review=code_result.needs_manual_review,
             plan_steps=code_result.plan_steps,
             step_traces=code_result.step_traces,
+            project_structure_context=code_result.project_structure_context,
+            source_guide=code_result.source_guide,
         )
 
     def _prescreen_section(

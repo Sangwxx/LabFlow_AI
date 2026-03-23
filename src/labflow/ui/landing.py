@@ -85,12 +85,12 @@ def _render_repo_input_card(column, *, has_repo_path: bool) -> str:
 def _render_landing_action(*, has_pdf: bool, has_repo_path: bool) -> None:
     _, action_center, _ = st.columns([1.25, 0.9, 1.25])
     with action_center:
+        readiness_text = build_landing_readiness_text(
+            has_pdf=has_pdf,
+            has_repo_path=has_repo_path,
+        )
         st.markdown(
-            (
-                '<div class="landing-action-hint">'
-                f"{escape(build_landing_readiness_text(has_pdf=has_pdf, has_repo_path=has_repo_path))}"
-                "</div>"
-            ),
+            (f'<div class="landing-action-hint">{escape(readiness_text)}</div>'),
             unsafe_allow_html=True,
         )
         if st.button("进入工作区", type="primary", use_container_width=True):
@@ -127,9 +127,7 @@ def build_landing_entry_header_html(
     status_tone: str,
 ) -> str:
     status_class = (
-        "entry-card-state entry-card-state-ready"
-        if status_tone == "ready"
-        else "entry-card-state"
+        "entry-card-state entry-card-state-ready" if status_tone == "ready" else "entry-card-state"
     )
     return (
         '<div class="entry-card-head">'

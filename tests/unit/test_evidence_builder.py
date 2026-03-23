@@ -40,6 +40,23 @@ class FakeSemanticSummaryLLMClient:
         }
 
 
+class CountingSemanticSummaryLLMClient:
+    """记录语义摘要调用次数，验证缓存是否生效。"""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def generate_json(self, **_: object) -> dict:
+        self.calls += 1
+        return {
+            "summary": "这段代码负责维护图结构。",
+            "responsibilities": ["维护图结构"],
+            "defined_symbols": ["update_graph"],
+            "called_symbols": ["add_edge"],
+            "anchor_terms": ["graph", "topological map"],
+        }
+
+
 def test_evidence_builder_builds_sections_from_pdf_blocks() -> None:
     """我会把标题块和正文块重新拼成章节。"""
 
@@ -607,3 +624,69 @@ def test_evidence_builder_can_find_definition_across_files() -> None:
     assert candidates
     assert candidates[0].code_evidence.file_name == "projection.py"
     assert "project_tokens" in observation
+
+
+def test_semantic_index_skips_llm_for_large_repo() -> None:
+    """大仓库应直接走本地语义摘要，避免为每个逻辑块请求 LLM。"""
+
+    builder = EvidenceBuilder()
+    builder.SEMANTIC_LLM_SUMMARY_LIMIT = 1
+    llm_client = CountingSemanticSummaryLLMClient()
+    evidences = (
+        CodeEvidence(
+            file_name="graph.py",
+            code_snippet="def update_graph(node):\n    return node\n",
+            related_git_diff="",
+            symbols=("update_graph",),
+            commit_context=(),
+            start_line=1,
+            end_line=2,
+            symbol_name="update_graph",
+            block_type="function",
+        ),
+        CodeEvidence(
+            file_name="encoder.py",
+            code_snippet="def encode(x):\n    return x\n",
+            related_git_diff="",
+            symbols=("encode",),
+            commit_context=(),
+            start_line=1,
+            end_line=2,
+            symbol_name="encode",
+            block_type="function",
+        ),
+    )
+
+    semantic_index = builder.build_semantic_index_from_evidences(
+        evidences,
+        llm_client=llm_client,
+    )
+
+    assert len(semantic_index) == 2
+    assert llm_client.calls == 0
+    assert semantic_index[0].summary.startswith("graph.py 的 function 逻辑块")
+
+
+def test_semantic_index_reuses_cached_summary_for_same_evidence() -> None:
+    """相同代码块重复构建语义索引时，应复用缓存避免重复请求 LLM。"""
+
+    builder = EvidenceBuilder()
+    builder.SEMANTIC_LLM_SUMMARY_LIMIT = 10
+    llm_client = CountingSemanticSummaryLLMClient()
+    evidence = CodeEvidence(
+        file_name="graph.py",
+        code_snippet="def update_graph(node):\n    add_edge(node)\n    return node\n",
+        related_git_diff="",
+        symbols=("update_graph", "add_edge"),
+        commit_context=(),
+        start_line=1,
+        end_line=3,
+        symbol_name="update_graph",
+        block_type="function",
+    )
+
+    first = builder.build_semantic_index_from_evidences((evidence,), llm_client=llm_client)
+    second = builder.build_semantic_index_from_evidences((evidence,), llm_client=llm_client)
+
+    assert first == second
+    assert llm_client.calls == 1

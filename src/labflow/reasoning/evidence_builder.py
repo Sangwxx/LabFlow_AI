@@ -69,6 +69,18 @@ PYTHON_KEYWORDS = {
 class EvidenceBuilder:
     """我负责把仓库切成 Agent 真能追逻辑的证据单元。"""
 
+    SEMANTIC_LLM_SUMMARY_LIMIT = 80
+
+    def __init__(self) -> None:
+        self._semantic_summary_cache: dict[
+            tuple[str, tuple[object, ...]],
+            CodeSemanticSummary,
+        ] = {}
+        self._semantic_index_cache: dict[
+            tuple[str, tuple[tuple[object, ...], ...]],
+            tuple[CodeSemanticSummary, ...],
+        ] = {}
+
     def build_project_structure(
         self,
         repo_result: GitRepoParseResult,
@@ -343,10 +355,23 @@ class EvidenceBuilder:
         *,
         llm_client: LLMClient | None = None,
     ) -> tuple[CodeSemanticSummary, ...]:
+        llm_client = self._resolve_semantic_summary_llm_client(
+            code_evidences,
+            llm_client=llm_client,
+        )
+        mode_key = self._semantic_mode_key(llm_client)
+        evidence_keys = tuple(self._semantic_evidence_key(evidence) for evidence in code_evidences)
+        cache_key = (mode_key, evidence_keys)
+        cached_index = self._semantic_index_cache.get(cache_key)
+        if cached_index is not None:
+            return cached_index
+
         summaries: list[CodeSemanticSummary] = []
         for evidence in code_evidences:
             summaries.append(self._summarize_code_evidence(evidence, llm_client=llm_client))
-        return tuple(summaries)
+        semantic_index = tuple(summaries)
+        self._semantic_index_cache[cache_key] = semantic_index
+        return semantic_index
 
     def retrieve_semantic_candidates(
         self,
@@ -953,6 +978,14 @@ class EvidenceBuilder:
         *,
         llm_client: LLMClient | None = None,
     ) -> CodeSemanticSummary:
+        cache_key = (
+            self._semantic_mode_key(llm_client),
+            self._semantic_evidence_key(evidence),
+        )
+        cached_summary = self._semantic_summary_cache.get(cache_key)
+        if cached_summary is not None:
+            return cached_summary
+
         fallback_defined_symbols = tuple(self._extract_defined_symbols(evidence.code_snippet))
         fallback_called_symbols = tuple(self._extract_called_symbols(evidence.code_snippet))
         fallback_anchor_terms = tuple(
@@ -970,12 +1003,14 @@ class EvidenceBuilder:
         )
 
         if llm_client is None:
-            return self._build_fallback_semantic_summary(
+            summary = self._build_fallback_semantic_summary(
                 evidence,
                 defined_symbols=fallback_defined_symbols,
                 called_symbols=fallback_called_symbols,
                 anchor_terms=fallback_anchor_terms,
             )
+            self._semantic_summary_cache[cache_key] = summary
+            return summary
 
         try:
             payload = llm_client.generate_json(
@@ -984,16 +1019,18 @@ class EvidenceBuilder:
                 temperature=0.0,
                 max_tokens=700,
             )
-        except RuntimeError:
+        except Exception:
             payload = None
 
         if not isinstance(payload, dict):
-            return self._build_fallback_semantic_summary(
+            summary = self._build_fallback_semantic_summary(
                 evidence,
                 defined_symbols=fallback_defined_symbols,
                 called_symbols=fallback_called_symbols,
                 anchor_terms=fallback_anchor_terms,
             )
+            self._semantic_summary_cache[cache_key] = summary
+            return summary
 
         responsibilities = self._normalize_string_list(payload.get("responsibilities"))
         defined_symbols = tuple(
@@ -1020,13 +1057,46 @@ class EvidenceBuilder:
             called_symbols=called_symbols,
         )
 
-        return CodeSemanticSummary(
+        summary_result = CodeSemanticSummary(
             code_evidence=evidence,
             summary=summary,
             responsibilities=responsibilities or (summary,),
             defined_symbols=defined_symbols,
             called_symbols=called_symbols,
             anchor_terms=anchor_terms,
+        )
+        self._semantic_summary_cache[cache_key] = summary_result
+        return summary_result
+
+    def _resolve_semantic_summary_llm_client(
+        self,
+        code_evidences: tuple[CodeEvidence, ...],
+        *,
+        llm_client: LLMClient | None,
+    ) -> LLMClient | None:
+        if llm_client is None:
+            return None
+        if len(code_evidences) > self.SEMANTIC_LLM_SUMMARY_LIMIT:
+            return None
+        return llm_client
+
+    def _semantic_mode_key(self, llm_client: LLMClient | None) -> str:
+        if llm_client is None:
+            return "local"
+        settings = getattr(llm_client, "_settings", None)
+        base_url = getattr(settings, "base_url", "") or ""
+        model_name = getattr(settings, "model_name", "") or ""
+        return f"llm:{base_url}:{model_name}"
+
+    def _semantic_evidence_key(self, evidence: CodeEvidence) -> tuple[object, ...]:
+        return (
+            evidence.absolute_path or evidence.file_name,
+            evidence.start_line,
+            evidence.end_line,
+            evidence.block_type,
+            evidence.symbol_name,
+            evidence.parent_symbol,
+            evidence.code_snippet,
         )
 
     def _build_fallback_semantic_summary(

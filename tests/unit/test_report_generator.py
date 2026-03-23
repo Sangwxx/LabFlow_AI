@@ -1,7 +1,7 @@
 """报告生成器测试。"""
 
 from labflow.reasoning.models import AlignmentResult
-from labflow.reporting import ReportGenerator
+from labflow.reporting import ReadingNoteEntry, ReportGenerator
 
 
 def build_result(
@@ -24,6 +24,24 @@ def build_result(
         improvement_suggestion=suggestion,
         retrieval_score=score,
     )
+
+
+class FakeLiteratureNoteLLMClient:
+    """返回一段简洁的阅读笔记 Markdown。"""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def generate_text(self, **_: object) -> str:
+        self.calls += 1
+        return (
+            "# LabFlow 文献阅读笔记\n\n"
+            "## 综述\n"
+            "- 论文片段和代码实现之间存在明确对应。\n\n"
+            "## 片段说明\n"
+            "- 论文说了什么：拓扑地图不断累积。\n"
+            "- 代码做了什么：更新图结构并计算位置特征。\n"
+        )
 
 
 def test_report_generator_outputs_markdown_sections() -> None:
@@ -89,3 +107,60 @@ def test_report_generator_summary_uses_ten_point_scale() -> None:
     assert summary.total_items == 2
     assert summary.high_risk_items == 1
     assert summary.overall_confidence == 6.0
+
+
+def test_report_generator_can_build_literature_notes_markdown() -> None:
+    """阅读笔记应支持把论文片段和代码一起整理成可下载 Markdown。"""
+
+    entry = ReadingNoteEntry(
+        paper_section_title="3.1 Topological Mapping",
+        paper_section_content="The environment graph is initially unknown to the agent.",
+        paper_section_page_number=3,
+        paper_section_order=12,
+        alignment_result=build_result(
+            title="3.1 Topological Mapping",
+            file_name="graph_utils.py",
+            score=0.81,
+            match_type="strong_match",
+            analysis="这段代码更新拓扑地图并维护节点状态。",
+            suggestion="保持当前图更新逻辑。",
+        ),
+    )
+
+    markdown = ReportGenerator().generate_literature_notes_markdown(
+        entries=(entry,),
+        llm_client=FakeLiteratureNoteLLMClient(),
+        project_overview=("当前工作区已记录 1 个片段与对应代码。",),
+    )
+
+    assert "# LabFlow 文献阅读笔记" in markdown
+    assert "论文片段和代码实现之间存在明确对应" in markdown
+
+
+def test_report_generator_falls_back_when_note_llm_is_missing() -> None:
+    """没有 LLM 时，报告仍应能回退到稳定的 Markdown 结构。"""
+
+    entry = ReadingNoteEntry(
+        paper_section_title="3.2 Global Action Planning",
+        paper_section_content="The coarse-scale encoder predicts actions.",
+        paper_section_page_number=4,
+        paper_section_order=21,
+        alignment_result=build_result(
+            title="3.2 Global Action Planning",
+            file_name="vilmodel.py",
+            score=0.76,
+            match_type="partial_match",
+            analysis="这段代码负责全局地图节点输入和动作预测。",
+            suggestion="继续追踪全局编码器的调用链。",
+        ),
+    )
+
+    markdown = ReportGenerator().generate_literature_notes_markdown(
+        entries=(entry,),
+        llm_client=None,
+        project_overview=(),
+    )
+
+    assert "# LabFlow 文献阅读笔记" in markdown
+    assert "论文要点" in markdown
+    assert "后续阅读建议" in markdown

@@ -101,13 +101,17 @@ def _render_api_key_input(settings: Settings) -> str | None:
     if status_text:
         st.caption(status_text)
 
+    api_key_help = (
+        "默认复用 `.env` 中的 API Key，出于安全原因这里不会回显真实值；"
+        "如需临时覆盖，请在这里输入新值。"
+    )
     st.text_input(
         "API Key",
         value="",
         key=SESSION_API_KEY_INPUT_KEY,
         type="password",
         placeholder="留空时继续使用 .env 中的 API Key",
-        help="默认复用 `.env` 中的 API Key，出于安全原因这里不会回显真实值；如需临时覆盖，请在这里输入新值。",
+        help=api_key_help,
         on_change=_apply_api_key_override,
     )
     if stored_api_key and st.button("清除会话覆盖", use_container_width=True):

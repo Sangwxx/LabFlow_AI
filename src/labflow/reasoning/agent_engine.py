@@ -361,10 +361,7 @@ class PlanAndExecuteEngine:
         started_at = time.monotonic()
 
         while active_plan.steps and not active_plan.is_finished:
-            if (
-                max_runtime_sec is not None
-                and time.monotonic() - started_at >= max_runtime_sec
-            ):
+            if max_runtime_sec is not None and time.monotonic() - started_at >= max_runtime_sec:
                 active_plan = self._build_timeout_plan(active_plan)
                 self._emit_plan(active_plan, event_handler)
                 break
@@ -404,10 +401,7 @@ class PlanAndExecuteEngine:
                 trace,
                 role_prompt=role_prompt,
             )
-            if (
-                max_runtime_sec is not None
-                and time.monotonic() - started_at >= max_runtime_sec
-            ):
+            if max_runtime_sec is not None and time.monotonic() - started_at >= max_runtime_sec:
                 active_plan = self._build_timeout_plan(active_plan)
             self._emit_plan(active_plan, event_handler)
 

@@ -5,6 +5,8 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 
+from labflow.clients.llm_client import LLMClient
+from labflow.reasoning.code_knowledge_index import CodeKnowledgeIndex
 from labflow.reasoning.evidence_builder import EvidenceBuilder
 from labflow.reasoning.models import AlignmentCandidate, CodeEvidence, PaperSection, ToolName
 
@@ -62,8 +64,13 @@ class ToolRegistry:
 class ReasoningToolbox:
     """默认工具箱实现。"""
 
-    def __init__(self, evidence_builder: EvidenceBuilder) -> None:
+    def __init__(
+        self,
+        evidence_builder: EvidenceBuilder,
+        llm_client: LLMClient | None = None,
+    ) -> None:
         self._evidence_builder = evidence_builder
+        self._llm_client = llm_client
 
     def build_registry(self) -> ToolRegistry:
         return ToolRegistry(
@@ -94,9 +101,9 @@ class ReasoningToolbox:
         context: AgentToolContext,
     ) -> ToolExecutionResult:
         params = action_input if isinstance(action_input, dict) else {}
-        path = str(params.get("path", "")).strip()
-        line_start = int(params.get("line_start", 1))
-        line_end = int(params.get("line_end", line_start))
+        path = str(params.get("path") or params.get("file_path") or "").strip()
+        line_start = int(params.get("line_start", params.get("start_line", 1)))
+        line_end = int(params.get("line_end", params.get("end_line", line_start)))
         observation, candidate_ids = self._evidence_builder.read_logic_block(
             context.code_evidences,
             path=path,
@@ -123,7 +130,8 @@ class ReasoningToolbox:
         params = action_input if isinstance(action_input, dict) else {}
         query = str(params.get("query", "")).strip() or context.paper_section.combined_text
         semantic_index = self._evidence_builder.build_semantic_index_from_evidences(
-            context.code_evidences
+            context.code_evidences,
+            llm_client=self._llm_client,
         )
         synthetic_section = PaperSection(
             title=context.paper_section.title,
@@ -132,10 +140,15 @@ class ReasoningToolbox:
             page_number=context.paper_section.page_number,
             order=context.paper_section.order,
         )
-        candidates = self._evidence_builder.retrieve_semantic_candidates(
-            synthetic_section,
+        knowledge_index = CodeKnowledgeIndex(
             semantic_index,
-            top_k=4,
+            llm_client=self._llm_client,
+        )
+        candidates = knowledge_index.search(
+            synthetic_section,
+            focus_terms=tuple(query.split()),
+            top_k=6,
+            use_llm_rerank=False,
         )
         traced_candidates = self._evidence_builder.trace_related_candidates(
             synthetic_section,

@@ -6,14 +6,17 @@ from labflow.reasoning.agent_engine import (
     PlanAndExecutePlanner,
     PlanAndExecuteRePlanner,
 )
-from labflow.reasoning.agent_tools import ReasoningToolbox
+from labflow.reasoning.agent_executor import PlanAndExecuteAgent
+from labflow.reasoning.agent_tools import AgentToolContext, ReasoningToolbox
 from labflow.reasoning.evidence_builder import EvidenceBuilder
 from labflow.reasoning.models import (
     AlignmentCandidate,
+    AlignmentResult,
     CodeEvidence,
     ExecutionPlan,
     PaperSection,
     PlanStep,
+    SourceGuideItem,
 )
 
 
@@ -89,6 +92,55 @@ def test_tool_registry_exposes_expected_tools() -> None:
         "llm_semantic_search",
         "find_definition",
     )
+
+
+def test_read_code_segment_accepts_executor_style_alias_params() -> None:
+    """执行器传 file_path/start_line/end_line 时，工具层也应能正确读取逻辑块。"""
+
+    registry = ReasoningToolbox(EvidenceBuilder()).build_registry()
+    section = PaperSection(
+        title="3.1 Topological Mapping",
+        content="The model gradually builds its own map using observations along the path.",
+        level=2,
+        page_number=3,
+        order=1,
+    )
+    evidence = CodeEvidence(
+        file_name="map_nav_src/models/graph_utils.py",
+        code_snippet=(
+            "def update_graph(self, ob):\n"
+            "    self.node_positions[ob['viewpoint']] = ob['position']\n"
+            "    self.graph.update(ob['viewpoint'])\n"
+        ),
+        related_git_diff="",
+        symbols=("update_graph",),
+        commit_context=(),
+        start_line=106,
+        end_line=108,
+        symbol_name="GraphMap.update_graph",
+        parent_symbol="GraphMap",
+        block_type="method",
+    )
+    candidate = AlignmentCandidate(section, evidence, 1.2)
+
+    result = registry.execute(
+        "read_code_segment",
+        {
+            "file_path": "map_nav_src/models/graph_utils.py",
+            "start_line": 106,
+            "end_line": 108,
+        },
+        AgentToolContext(
+            paper_section=section,
+            project_structure="map_nav_src / models / graph_utils.py",
+            code_evidences=(evidence,),
+            current_candidates=(candidate,),
+        ),
+    )
+
+    assert result.tool_name == "read_code_segment"
+    assert "update_graph" in result.observation
+    assert result.candidates[0].code_evidence.symbol_name == "GraphMap.update_graph"
 
 
 def test_engine_runs_with_registry_driven_executor() -> None:
@@ -204,12 +256,67 @@ def test_engine_stops_early_when_executor_falls_back_without_tool_calls() -> Non
     )
 
     assert plan.is_finished is True
-    assert plan.final_summary == "执行器当前没有稳定产出结构化工具动作，本轮先用已有候选直接生成结果。"
+    assert (
+        plan.final_summary == "执行器当前没有稳定产出结构化工具动作，本轮先用已有候选直接生成结果。"
+    )
     assert len(traces) == 1
     assert traces[0].used_fallback is True
     assert traces[0].tool_invocations == ()
     assert latest_candidates == candidates
     assert llm_client.replanner_call_count == 0
+
+
+def test_merge_learning_and_code_result_preserves_source_guide_fields() -> None:
+    """总控合并导师讲解与代码结果时，不应丢掉源码导览需要的结构化字段。"""
+
+    agent = PlanAndExecuteAgent(
+        llm_client=FakeRuntimeLLMClient(), evidence_builder=EvidenceBuilder()
+    )
+    learning_result = AlignmentResult(
+        paper_section_title="3.2.2 Coarse-scale Cross-modal Encoder",
+        code_file_name="未定位到本地实现",
+        alignment_score=0.0,
+        match_type="missing_implementation",
+        analysis="中文译文",
+        improvement_suggestion="",
+        retrieval_score=0.0,
+    )
+    code_result = AlignmentResult(
+        paper_section_title="3.2.2 Coarse-scale Cross-modal Encoder",
+        code_file_name="map_nav_src/models/vilmodel.py",
+        alignment_score=0.81,
+        match_type="strong_match",
+        analysis="源码分析",
+        improvement_suggestion="",
+        retrieval_score=2.7,
+        implementation_chain="主实现落在 GraphLXRTXLayer.forward。",
+        code_snippet="def forward(self, x):\n    return x\n",
+        code_start_line=383,
+        code_end_line=384,
+        project_structure_context=(
+            "项目主干目录：map_nav_src / pretrain_src / configs。",
+            "map_nav_src/models：承载模型主干与编码模块。",
+        ),
+        source_guide=(
+            SourceGuideItem(
+                file_name="map_nav_src/models/vilmodel.py",
+                symbol_name="GraphLXRTXLayer.forward",
+                block_type="function",
+                start_line=383,
+                end_line=398,
+                summary="这里负责 coarse-scale cross-modal encoder 的核心前向计算。",
+                responsibilities=("处理图节点与文本的跨模态交互。",),
+                relevance_reason="它直接对应论文中的 coarse-scale cross-modal encoder。",
+                code_preview="def forward(self, x):\n    return x",
+                retrieval_score=2.7,
+            ),
+        ),
+    )
+
+    merged = agent._merge_learning_and_code_result(learning_result, code_result)
+
+    assert merged.project_structure_context == code_result.project_structure_context
+    assert merged.source_guide == code_result.source_guide
 
 
 def test_engine_finishes_with_timeout_plan_when_budget_is_exhausted() -> None:

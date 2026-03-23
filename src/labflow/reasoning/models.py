@@ -125,6 +125,22 @@ class AlignmentCandidate:
 
 
 @dataclass(frozen=True)
+class SourceGuideItem:
+    """源码导览中的单个实现模块。"""
+
+    file_name: str
+    symbol_name: str
+    block_type: str
+    start_line: int
+    end_line: int
+    summary: str
+    responsibilities: tuple[str, ...] = ()
+    relevance_reason: str = ""
+    code_preview: str = ""
+    retrieval_score: float = 0.0
+
+
+@dataclass(frozen=True)
 class PlanStep:
     """规划器产出的单个步骤。"""
 
@@ -205,6 +221,8 @@ class AlignmentResult:
     needs_manual_review: bool = False
     plan_steps: tuple[PlanStep, ...] = ()
     step_traces: tuple[StepExecutionTrace, ...] = ()
+    project_structure_context: tuple[str, ...] = ()
+    source_guide: tuple[SourceGuideItem, ...] = ()
 
     @property
     def score_out_of_ten(self) -> float:

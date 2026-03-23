@@ -1,14 +1,20 @@
-"""工作区语义代码画布测试。"""
+"""工作区与首页 UI 相关测试。"""
 
+import streamlit as st
+
+import labflow.ui.app as app_module
 from labflow.config.settings import Settings
-from labflow.reasoning.models import AlignmentResult, PaperSection
+from labflow.reasoning.models import AlignmentResult, PaperSection, SourceGuideItem
 from labflow.ui.app import (
     build_landing_entry_header_html,
-    build_landing_readiness_text,
-    build_highlighted_code_html,
     build_landing_hero_html,
+    build_landing_readiness_text,
+    build_reading_note_project_overview,
     build_source_overview_html,
+    generate_reading_note_markdown,
+    get_reading_note_entries,
     get_selected_section,
+    record_reading_note_entry,
     resolve_focus_section_index,
     resolve_runtime_settings,
     should_render_source_grounding,
@@ -16,40 +22,30 @@ from labflow.ui.app import (
 from labflow.ui.sidebar import SidebarState, _build_api_key_status
 
 
-def test_build_highlighted_code_html_marks_semantic_lines() -> None:
-    """语义命中的逻辑行应该在代码画布里被显式高亮。"""
+def build_result(
+    *,
+    title: str,
+    file_name: str,
+    score: float,
+    match_type: str,
+    analysis: str,
+    suggestion: str,
+) -> AlignmentResult:
+    """构造测试用的对齐结果。"""
 
-    alignment_result = AlignmentResult(
-        paper_section_title="3.1 多头注意力",
-        code_file_name="attention.py",
-        alignment_score=0.91,
-        match_type="strong_match",
-        analysis="这段实现完成了论文中的多头注意力。",
-        semantic_evidence="q/k/v 投影、按 8 个 head 重排、拼接后输出映射，逻辑完整闭环。",
-        improvement_suggestion="可补一段注释说明 head 的配置来源。",
-        retrieval_score=0.18,
-        highlighted_line_numbers=(24, 26),
-        code_snippet=(
-            "q = self.q_proj(x)\n"
-            "k = self.k_proj(x)\n"
-            "heads = rearrange(q, 'b n (h d) -> b h n d', h=8)"
-        ),
-        code_start_line=24,
-        code_end_line=26,
+    return AlignmentResult(
+        paper_section_title=title,
+        code_file_name=file_name,
+        alignment_score=score,
+        match_type=match_type,
+        analysis=analysis,
+        improvement_suggestion=suggestion,
+        retrieval_score=score,
     )
 
-    html = build_highlighted_code_html(alignment_result)
 
-    assert "attention.py" in html
-    assert "code-line-highlight" in html
-    assert ">24<" in html
-    assert ">26<" in html
-    assert "rearrange" in html
-    assert html.startswith('<div class="semantic-code-shell">')
-
-
-def test_build_source_overview_html_contains_grounding_summary() -> None:
-    """源码定位概览卡应把文件、范围和说明收拢到同一个区域。"""
+def test_build_source_overview_html_only_keeps_related_modules() -> None:
+    """源码导览顶部概览区删除后，只保留关联模块。"""
 
     alignment_result = AlignmentResult(
         paper_section_title="3.2 Graph Policy",
@@ -61,7 +57,65 @@ def test_build_source_overview_html_contains_grounding_summary() -> None:
         research_supplement="术语",
         implementation_chain="当前展示的源码片段来自 map_nav_src/models/vilmodel.py。",
         operator_alignment="这段代码里有图注意力相关算子。",
-        shape_alignment="这里能看到图结构偏置被加到 attention mask 上。",
+        shape_alignment="这里能看到图结构偏置被加到 attention mask 里。",
+        confidence_note="建议人工核对 global encoder 的上游调用。",
+        improvement_suggestion="",
+        retrieval_score=0.45,
+        code_snippet="graph_sprels = self.sprel_linear(x)",
+        code_start_line=365,
+        code_end_line=392,
+        project_structure_context=(
+            "项目主干目录：map_nav_src（2） / pretrain_src（2）。",
+            "map_nav_src/models：承载模型主干、编码层和核心机制实现，当前目录共 7 个文件。",
+        ),
+        source_guide=(
+            SourceGuideItem(
+                file_name="map_nav_src/models/vilmodel.py",
+                symbol_name="GraphLXRTXLayer.forward",
+                block_type="method",
+                start_line=384,
+                end_line=395,
+                summary="这段 forward 负责把语言特征、视觉特征和图结构偏置拼到同一层里。",
+                responsibilities=(
+                    "挂在 `GraphLXRTXLayer` 这一层级下。",
+                    "代码范围位于 L384-L395，适合继续沿调用链复核。",
+                ),
+                relevance_reason="它命中的是图结构或全局规划相关实现，不是单纯的通用注意力壳层。",
+            ),
+        ),
+    )
+
+    html = build_source_overview_html(alignment_result)
+
+    assert "map_nav_src/models/vilmodel.py" in html
+    assert "L384-L395" in html
+    assert "源码片段来自" in html
+    assert "图结构偏置" in html
+    assert "关联模块" in html
+    assert "GraphLXRTXLayer.forward" in html
+    assert "命中文件" not in html
+    assert "代码范围" not in html
+    assert "对齐分" not in html
+    assert "召回分" not in html
+    assert "项目结构定位" not in html
+    assert "这段代码在做什么" not in html
+    assert "它和论文片段的关系" not in html
+
+
+def test_build_source_overview_html_is_backward_compatible_with_old_cache_result() -> None:
+    """旧缓存里的 AlignmentResult 缺少新字段时，源码导览也不应报错。"""
+
+    alignment_result = AlignmentResult(
+        paper_section_title="3.2 Graph Policy",
+        code_file_name="map_nav_src/models/vilmodel.py",
+        alignment_score=0.83,
+        match_type="strong_match",
+        analysis="译文",
+        semantic_evidence="重点",
+        research_supplement="术语",
+        implementation_chain="当前展示的源码片段来自 map_nav_src/models/vilmodel.py。",
+        operator_alignment="这段代码里有图注意力相关算子。",
+        shape_alignment="这里能看到图结构偏置被加到 attention mask 里。",
         confidence_note="建议人工核对 global encoder 的上游调用。",
         improvement_suggestion="",
         retrieval_score=0.45,
@@ -69,17 +123,122 @@ def test_build_source_overview_html_contains_grounding_summary() -> None:
         code_start_line=365,
         code_end_line=392,
     )
+    del alignment_result.__dict__["project_structure_context"]
+    del alignment_result.__dict__["source_guide"]
 
     html = build_source_overview_html(alignment_result)
 
-    assert "map_nav_src/models/vilmodel.py" in html
-    assert "L365-L392" in html
-    assert "源码片段来自" in html
-    assert "图结构偏置" in html
+    assert "关联模块" not in html
+
+
+def test_reading_note_history_accumulates_and_sorts_entries() -> None:
+    """阅读笔记应累计已读片段，并按论文顺序输出。"""
+
+    st.session_state.clear()
+    st.session_state["reading_note_history"] = {}
+    st.session_state["reading_note_markdown"] = "old-note"
+
+    section_later = PaperSection(
+        title="3.2 Global Action Planning",
+        content="The coarse-scale encoder predicts actions.",
+        level=1,
+        page_number=4,
+        order=21,
+    )
+    section_earlier = PaperSection(
+        title="3.1 Topological Mapping",
+        content="The environment graph is initially unknown.",
+        level=1,
+        page_number=3,
+        order=12,
+    )
+    alignment_later = build_result(
+        title="3.2 Global Action Planning",
+        file_name="vilmodel.py",
+        score=0.76,
+        match_type="partial_match",
+        analysis="这段代码负责把粗尺度地图输入转成动作打分。",
+        suggestion="继续追踪全局编码器调用链。",
+    )
+    alignment_earlier = build_result(
+        title="3.1 Topological Mapping",
+        file_name="graph_utils.py",
+        score=0.81,
+        match_type="strong_match",
+        analysis="这段代码负责维护拓扑图状态。",
+        suggestion="继续追踪图更新与路径查询。",
+    )
+
+    record_reading_note_entry("workspace-b", section_later, alignment_later)
+    record_reading_note_entry("workspace-a", section_earlier, alignment_earlier)
+
+    entries = get_reading_note_entries()
+
+    assert st.session_state["reading_note_markdown"] == ""
+    assert [entry.paper_section_order for entry in entries] == [12, 21]
+    assert entries[0].paper_section_title == "3.1 Topological Mapping"
+    assert entries[1].paper_section_title == "3.2 Global Action Planning"
+
+
+def test_generate_reading_note_markdown_uses_report_generator(monkeypatch) -> None:
+    """生成阅读笔记时应复用报告生成器和 LLM 入口。"""
+
+    class FakeNoteLLM:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def generate_text(self, **_: object) -> str:
+            self.calls += 1
+            return "# LabFlow 文献阅读笔记\n\n- 论文与代码实现之间存在清晰对应。\n"
+
+    fake_llm = FakeNoteLLM()
+    monkeypatch.setattr(app_module, "get_llm_client", lambda _settings: fake_llm)
+
+    workspace = app_module.WorkspaceState(
+        pdf_bytes=None,
+        pdf_name=None,
+        pdf_result=None,
+        pdf_error=None,
+        repo_result=None,
+        repo_error=None,
+        focus_sections=(),
+        project_structure="map_nav_src 与 pretrain_src 构成主要结构。",
+    )
+    entry = app_module.ReadingNoteEntry(
+        paper_section_title="3.1 Topological Mapping",
+        paper_section_content="The environment graph is initially unknown to the agent.",
+        paper_section_page_number=3,
+        paper_section_order=12,
+        alignment_result=build_result(
+            title="3.1 Topological Mapping",
+            file_name="graph_utils.py",
+            score=0.81,
+            match_type="strong_match",
+            analysis="这段代码负责维护拓扑图状态。",
+            suggestion="继续追踪图更新与路径查询。",
+        ),
+    )
+
+    markdown = generate_reading_note_markdown(
+        entries=(entry,),
+        workspace=workspace,
+        runtime_settings=Settings(
+            app_env="dev",
+            api_key="test-key",
+            base_url="https://api.example.com/v1",
+            model_name="test-model",
+        ),
+    )
+    overview = build_reading_note_project_overview(workspace, (entry,))
+
+    assert fake_llm.calls == 1
+    assert "# LabFlow 文献阅读笔记" in markdown
+    assert "论文与代码实现之间存在清晰对应。" in markdown
+    assert "当前工作区已累计 1 个已读片段与对应代码。" in overview[0]
 
 
 def test_build_landing_entry_header_html_marks_ready_status() -> None:
-    """首页入口卡应该保留步骤、标题和精简状态。"""
+    """首页入口卡应保留步骤、标题和状态。"""
 
     html = build_landing_entry_header_html(
         step_label="步骤 1",
@@ -96,16 +255,18 @@ def test_build_landing_entry_header_html_marks_ready_status() -> None:
 
 
 def test_build_landing_readiness_text_summarizes_missing_steps() -> None:
-    """首页提示语应直接说清当前还缺什么。"""
+    """首页提示语应直接说明当前还缺什么。"""
 
     assert build_landing_readiness_text(has_pdf=False, has_repo_path=False) == "先完成这两项输入。"
     assert build_landing_readiness_text(has_pdf=True, has_repo_path=False) == "还差代码目录。"
     assert build_landing_readiness_text(has_pdf=False, has_repo_path=True) == "还差论文 PDF。"
-    assert build_landing_readiness_text(has_pdf=True, has_repo_path=True) == "已准备好，可以开始阅读。"
+    assert (
+        build_landing_readiness_text(has_pdf=True, has_repo_path=True) == "已准备好，可以开始阅读。"
+    )
 
 
 def test_build_landing_hero_html_reflects_progress_state() -> None:
-    """首页顶部应保持克制，只展示品牌、标题、副标题和状态。"""
+    """首页顶部只保留品牌、标题、副标题和状态。"""
 
     html = build_landing_hero_html(has_pdf=True, has_repo_path=False)
 
@@ -115,7 +276,7 @@ def test_build_landing_hero_html_reflects_progress_state() -> None:
 
 
 def test_get_selected_section_supports_initial_silent_state() -> None:
-    """未选择论文片段时，左侧焦点栏应保持静默。"""
+    """未选择论文片段时，焦点状态应保持为空。"""
 
     sections = (
         PaperSection(
@@ -138,7 +299,7 @@ def test_get_selected_section_supports_initial_silent_state() -> None:
 
 
 def test_resolve_focus_section_index_supports_merged_block_orders() -> None:
-    """合并后的自然段应该允许我点击其中任意一个原始块。"""
+    """合并后的自然段应允许点击其中任一原始块。"""
 
     sections = (
         PaperSection(
@@ -165,7 +326,7 @@ def test_resolve_focus_section_index_supports_merged_block_orders() -> None:
 
 
 def test_source_grounding_shows_for_viable_grounding_result() -> None:
-    """只要拿到了可信源码解释，源码落地模块就应该展示。"""
+    """只要拿到可读的源码解释，源码导览就应显示。"""
 
     strong_result = AlignmentResult(
         paper_section_title="3.1 多头注意力",
@@ -219,7 +380,7 @@ def test_source_grounding_shows_for_viable_grounding_result() -> None:
 
 
 def test_resolve_runtime_settings_prefers_sidebar_overrides() -> None:
-    """侧边栏里手动覆盖的模型配置应该真正进入运行时。"""
+    """侧边栏里的覆盖配置应进入运行时设置。"""
 
     base_settings = Settings(
         app_env="dev",
@@ -244,7 +405,7 @@ def test_resolve_runtime_settings_prefers_sidebar_overrides() -> None:
 
 
 def test_resolve_runtime_settings_falls_back_to_env_key() -> None:
-    """如果侧边栏没有手动输入密钥，就继续使用环境变量配置。"""
+    """未手动输入密钥时，继续使用环境变量配置。"""
 
     base_settings = Settings(
         app_env="dev",
@@ -267,7 +428,7 @@ def test_resolve_runtime_settings_falls_back_to_env_key() -> None:
 
 
 def test_build_api_key_status_does_not_require_echoing_secret() -> None:
-    """状态提示只描述来源，不应该要求把真实密钥显示回页面。"""
+    """状态提示只描述来源，不应回显真实密钥。"""
 
     assert (
         _build_api_key_status(has_env_api_key=True, has_session_override=False)

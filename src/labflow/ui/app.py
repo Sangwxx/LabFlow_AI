@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from html import escape
+
 import streamlit as st
 
 from labflow.clients.llm_client import LLMClient
@@ -13,6 +14,7 @@ from labflow.parsers.pdf_parser import PDFParser, PDFParseResult
 from labflow.reasoning.agent_executor import PlanAndExecuteAgent
 from labflow.reasoning.evidence_builder import EvidenceBuilder
 from labflow.reasoning.models import AlignmentResult, CodeEvidence, PaperSection
+from labflow.reporting import ReadingNoteEntry, ReportGenerator
 from labflow.ui.landing import (
     build_landing_entry_header_html,
     build_landing_hero_html,
@@ -24,9 +26,9 @@ from labflow.ui.sidebar import SidebarState, render_sidebar
 from labflow.ui.styles import inject_styles
 
 EVIDENCE_BUILDER = EvidenceBuilder()
-ALIGNMENT_CACHE_VERSION = "learning-output-v14"
+REPORT_GENERATOR = ReportGenerator()
+ALIGNMENT_CACHE_VERSION = "learning-output-v23"
 __all__ = [
-    "build_highlighted_code_html",
     "build_landing_entry_header_html",
     "build_landing_hero_html",
     "build_landing_readiness_text",
@@ -82,11 +84,18 @@ def init_session_state() -> None:
     st.session_state.setdefault("selected_section_index", None)
     st.session_state.setdefault("pdf_hotspot_viewer", None)
     st.session_state.setdefault("semantic_alignment_cache", {})
+    st.session_state.setdefault("reading_note_history", {})
+    st.session_state.setdefault("reading_note_markdown", "")
+
+
+@st.cache_resource(show_spinner=False)
+def get_llm_client(settings: Settings) -> LLMClient:
+    return LLMClient(settings=settings)
 
 
 @st.cache_resource(show_spinner=False)
 def get_alignment_agent(settings: Settings) -> PlanAndExecuteAgent:
-    return PlanAndExecuteAgent(llm_client=LLMClient(settings=settings))
+    return PlanAndExecuteAgent(llm_client=get_llm_client(settings))
 
 
 def get_sidebar_state(settings: Settings, current_route: str) -> SidebarState:
@@ -199,6 +208,10 @@ def get_workspace_state() -> WorkspaceState:
     if st.session_state.get("semantic_alignment_cache_signature") != signature:
         st.session_state["semantic_alignment_cache_signature"] = signature
         st.session_state["semantic_alignment_cache"] = {}
+    if st.session_state.get("reading_note_history_signature") != signature:
+        st.session_state["reading_note_history_signature"] = signature
+        st.session_state["reading_note_history"] = {}
+        st.session_state["reading_note_markdown"] = ""
     sync_section_selection(workspace)
     return workspace
 
@@ -389,7 +402,12 @@ def render_code_panel(
     if alignment_result is None:
         st.warning("本轮模型没有稳定返回，我已停止展示中间推理链。")
         return
-    render_code_canvas(alignment_result, trace_events)
+    record_reading_note_entry(
+        st.session_state.get("workspace_signature", ""),
+        selected_section,
+        alignment_result,
+    )
+    render_code_canvas(alignment_result, trace_events, workspace, runtime_settings)
 
 
 def get_semantic_alignment(
@@ -406,6 +424,7 @@ def get_semantic_alignment(
     if cached_result is not None:
         if event_handler is not None:
             event_handler({"kind": "cache_hit", "message": "命中缓存，直接复用上一次 Agent 结果。"})
+        record_reading_note_entry(workspace_signature, selected_section, cached_result)
         return cached_result
 
     code_evidences = load_code_evidences(repo_result)
@@ -416,6 +435,8 @@ def get_semantic_alignment(
         event_handler=event_handler,
     )
     st.session_state["semantic_alignment_cache"][cache_key] = alignment_result
+    if alignment_result is not None:
+        record_reading_note_entry(workspace_signature, selected_section, alignment_result)
     return alignment_result
 
 
@@ -466,8 +487,15 @@ def render_trace_event(event: dict, status=None) -> None:
         writer(f"**[Current Plan]** {event.get('message', '')}")
 
 
-def render_code_canvas(alignment_result: AlignmentResult, trace_events: list[dict]) -> None:
-    teach_tab, source_tab, trace_tab = st.tabs(["导师讲解", "源码定位", "推理链路"])
+def render_code_canvas(
+    alignment_result: AlignmentResult,
+    trace_events: list[dict],
+    workspace: WorkspaceState,
+    runtime_settings: Settings,
+) -> None:
+    teach_tab, source_tab, trace_tab, note_tab = st.tabs(
+        ["导师讲解", "源码导览", "推理链路", "阅读笔记"]
+    )
 
     with teach_tab:
         st.markdown("### 【中文译文】")
@@ -485,25 +513,39 @@ def render_code_canvas(alignment_result: AlignmentResult, trace_events: list[dic
     with trace_tab:
         render_trace_tab(trace_events)
 
+    with note_tab:
+        render_reading_note_tab(workspace, runtime_settings)
+
 
 def render_source_grounding_tab(alignment_result: AlignmentResult) -> None:
     if not should_render_source_grounding(alignment_result):
         st.info("当前还没有足够稳定的源码落地结果。")
         return
 
-    st.markdown("### 【源码落地】")
-    st.caption(
-        f"{alignment_result.code_file_name} · "
-        f"L{alignment_result.code_start_line}-L{alignment_result.code_end_line}"
-    )
+    source_guide = getattr(alignment_result, "source_guide", ())
+    st.markdown("### 【源码导览】")
+    st.caption("以下内容按当前论文片段聚合为更适合阅读的实现单元，不等同于唯一命中函数。")
     st.markdown(
         build_source_overview_html(alignment_result),
         unsafe_allow_html=True,
     )
 
-    st.markdown("### 【对应代码】")
-    with st.container(height=940):
-        st.markdown(build_highlighted_code_html(alignment_result), unsafe_allow_html=True)
+    if source_guide:
+        st.markdown("### 【相关实现】")
+        for index, guide_item in enumerate(source_guide, start=1):
+            title = (
+                f"{index}. {guide_item.symbol_name} · "
+                f"{guide_item.file_name} · L{guide_item.start_line}-L{guide_item.end_line}"
+            )
+            with st.expander(title, expanded=index == 1):
+                st.markdown("**这段代码在做什么**")
+                st.markdown(guide_item.summary)
+                if guide_item.relevance_reason:
+                    st.markdown("**和当前论文片段的关系**")
+                    st.markdown(guide_item.relevance_reason)
+                if guide_item.code_preview:
+                    st.markdown("**代码入口**")
+                    st.code(guide_item.code_preview, language=alignment_result.code_language)
 
 
 def render_trace_tab(trace_events: list[dict]) -> None:
@@ -516,6 +558,34 @@ def render_trace_tab(trace_events: list[dict]) -> None:
             render_trace_event(event)
 
 
+def render_reading_note_tab(workspace: WorkspaceState, runtime_settings: Settings) -> None:
+    entries = get_reading_note_entries()
+    if not entries:
+        st.info("先在左侧点开几个论文片段，系统会把对应结果积累到这里。")
+        return
+
+    st.caption(f"当前已记录 {len(entries)} 个已读片段与对应代码。")
+    if st.button("生成阅读笔记", use_container_width=True):
+        st.session_state["reading_note_markdown"] = generate_reading_note_markdown(
+            entries=entries,
+            workspace=workspace,
+            runtime_settings=runtime_settings,
+        )
+
+    markdown = st.session_state.get("reading_note_markdown", "").strip()
+    if markdown:
+        st.download_button(
+            "下载 Markdown 笔记",
+            data=markdown.encode("utf-8"),
+            file_name="labflow-reading-notes.md",
+            mime="text/markdown",
+            use_container_width=True,
+        )
+        st.markdown(markdown)
+    else:
+        st.info("点击上方按钮生成可下载的阅读笔记。")
+
+
 def should_render_source_grounding(alignment_result: AlignmentResult) -> bool:
     return (
         alignment_result.alignment_score >= 0.52
@@ -524,71 +594,115 @@ def should_render_source_grounding(alignment_result: AlignmentResult) -> bool:
     )
 
 
-def build_highlighted_code_html(alignment_result: AlignmentResult) -> str:
-    highlighted_lines = set(alignment_result.highlighted_line_numbers)
-    html_lines: list[str] = []
-    snippet_lines = alignment_result.code_snippet.splitlines() or [""]
-    for offset, raw_line in enumerate(snippet_lines):
-        absolute_line = alignment_result.code_start_line + offset
-        is_highlighted = absolute_line in highlighted_lines
-        line_class = "code-line code-line-highlight" if is_highlighted else "code-line"
-        html_lines.append(
-            (
-                f'<div class="{line_class}">'
-                f'<span class="code-line-number">{absolute_line}</span>'
-                f'<span class="code-line-content">{escape(raw_line) or "&nbsp;"}</span>'
-                "</div>"
-            )
-        )
+def record_reading_note_entry(
+    workspace_signature: str,
+    selected_section: PaperSection | None,
+    alignment_result: AlignmentResult | None,
+) -> None:
+    if selected_section is None or alignment_result is None:
+        return
 
-    return (
-        '<div class="semantic-code-shell">'
-        f'<div class="semantic-code-header">{escape(alignment_result.code_file_name)}</div>'
-        f'<div class="semantic-code-body">{"".join(html_lines)}</div>'
-        "</div>"
+    history: dict[str, ReadingNoteEntry] = st.session_state["reading_note_history"]
+    history[f"{workspace_signature}:{selected_section.order}"] = ReadingNoteEntry(
+        paper_section_title=selected_section.title,
+        paper_section_content=selected_section.content,
+        paper_section_page_number=selected_section.page_number,
+        paper_section_order=selected_section.order,
+        alignment_result=alignment_result,
+    )
+    st.session_state["reading_note_markdown"] = ""
+
+
+def get_reading_note_entries() -> tuple[ReadingNoteEntry, ...]:
+    history: dict[str, ReadingNoteEntry] = st.session_state.get("reading_note_history", {})
+    return tuple(
+        sorted(
+            history.values(),
+            key=lambda item: (item.paper_section_order, item.paper_section_page_number),
+        )
+    )
+
+
+def build_reading_note_project_overview(
+    workspace: WorkspaceState,
+    entries: tuple[ReadingNoteEntry, ...],
+) -> tuple[str, ...]:
+    overview = [
+        f"当前工作区已累计 {len(entries)} 个已读片段与对应代码。",
+        "笔记内容来自当前会话里已经查过的论文片段和源码结果。",
+    ]
+    if workspace.project_structure:
+        overview.append("当前项目结构索引已建立，适合继续追踪源码导览中的相关实现。")
+    return tuple(overview)
+
+
+def generate_reading_note_markdown(
+    *,
+    entries: tuple[ReadingNoteEntry, ...],
+    workspace: WorkspaceState,
+    runtime_settings: Settings,
+) -> str:
+    if not entries:
+        return "# LabFlow 文献阅读笔记\n\n当前还没有已记录的片段。\n"
+
+    llm_client = None
+    try:
+        llm_client = get_llm_client(runtime_settings)
+    except Exception:  # noqa: BLE001
+        llm_client = None
+
+    return REPORT_GENERATOR.generate_literature_notes_markdown(
+        entries=entries,
+        llm_client=llm_client,
+        project_overview=build_reading_note_project_overview(workspace, entries),
     )
 
 
 def build_source_overview_html(alignment_result: AlignmentResult) -> str:
-    cards = [
-        ("命中文件", alignment_result.code_file_name),
-        (
-            "代码范围",
-            f"L{alignment_result.code_start_line}-L{alignment_result.code_end_line}",
-        ),
-        ("对齐分", f"{alignment_result.alignment_score:.2f}"),
-        ("召回分", f"{alignment_result.retrieval_score:.2f}"),
-    ]
-    info_cards = "".join(
-        (
-            '<div class="source-meta-card">'
-            f'<div class="source-meta-label">{label}</div>'
-            f'<div class="source-meta-value">{escape(value)}</div>'
-            "</div>"
+    source_guide = getattr(alignment_result, "source_guide", ())
+    guide_cards = "".join(
+        "".join(
+            (
+                '<div class="source-guide-card">',
+                '<div class="source-guide-meta">',
+                f'<span class="source-guide-symbol">{escape(item.symbol_name)}</span>',
+                f'<span class="source-guide-range">{escape(item.file_name)} · '
+                f"L{item.start_line}-L{item.end_line}</span>",
+                "</div>",
+                f'<div class="source-guide-summary">{escape(item.summary)}</div>',
+                "</div>",
+            )
         )
-        for label, value in cards
+        for item in source_guide
     )
-    detail_items = [
-        ("关联说明", alignment_result.implementation_chain),
-        ("算子核对", alignment_result.operator_alignment),
-        ("形状线索", alignment_result.shape_alignment),
-        ("人工复核", alignment_result.confidence_note or "当前无需额外说明。"),
-    ]
-    detail_blocks = "".join(
-        (
-            '<div class="source-detail-block">'
-            f'<div class="source-detail-title">{title}</div>'
-            f'<div class="source-detail-body">{escape(content or "当前暂无补充。")}</div>'
-            "</div>"
+    legacy_text = " ".join(
+        text
+        for text in (
+            alignment_result.implementation_chain,
+            alignment_result.operator_alignment,
+            alignment_result.shape_alignment,
+            alignment_result.confidence_note,
         )
-        for title, content in detail_items
+        if text
     )
     return (
         '<div class="source-overview-shell">'
-        f'<div class="source-meta-grid">{info_cards}</div>'
-        f"{detail_blocks}"
+        + (
+            '<div class="source-guide-shell">'
+            '<div class="source-section-title">关联模块</div>'
+            f"{guide_cards}"
+            "</div>"
+            if guide_cards
+            else ""
+        )
+        + f"<!-- {escape(legacy_text)} -->"
         "</div>"
     )
+
+
+def _split_chain_sentences(chain: str) -> tuple[str, ...]:
+    normalized = chain.replace("`", " ").replace("\n", " ")
+    return tuple(sentence.strip() for sentence in normalized.split("。") if sentence.strip())
 
 
 def sync_sidebar_overrides(sidebar_state: SidebarState) -> None:

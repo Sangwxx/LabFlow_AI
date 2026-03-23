@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import ast
+import re
 from dataclasses import replace
 
 from labflow.clients.llm_client import LLMClient
@@ -13,6 +15,7 @@ from labflow.reasoning.agent_prompts import (
     build_reflection_system_prompt,
     build_reflection_user_prompt,
 )
+from labflow.reasoning.code_knowledge_index import CodeKnowledgeIndex
 from labflow.reasoning.evidence_builder import EvidenceBuilder
 from labflow.reasoning.models import (
     AlignmentCandidate,
@@ -21,6 +24,7 @@ from labflow.reasoning.models import (
     CodeSemanticSummary,
     ExecutionPlan,
     PaperSection,
+    SourceGuideItem,
     StepExecutionTrace,
 )
 
@@ -28,7 +32,7 @@ from labflow.reasoning.models import (
 class CodeGroundingAgent:
     """我只负责论文片段与源码逻辑的对齐和解释。"""
 
-    EXECUTION_BUDGET_SEC = 28.0
+    EXECUTION_BUDGET_SEC = 18.0
 
     def __init__(
         self,
@@ -50,7 +54,10 @@ class CodeGroundingAgent:
         plan: ExecutionPlan,
         event_handler: AgentEventHandler | None = None,
     ) -> AlignmentResult | None:
-        semantic_index = self._evidence_builder.build_semantic_index_from_evidences(code_evidences)
+        semantic_index = self._evidence_builder.build_semantic_index_from_evidences(
+            code_evidences,
+            llm_client=self._llm_client,
+        )
         self._emit_semantic_cards(semantic_index, event_handler)
         initial_candidates = self._build_initial_candidates(
             paper_section=paper_section,
@@ -66,6 +73,10 @@ class CodeGroundingAgent:
             )
             return None
 
+        execution_budget = self._resolve_execution_budget(
+            paper_section,
+            code_evidences=code_evidences,
+        )
         current_plan, step_traces, current_candidates = self._engine.run(
             paper_section=paper_section,
             project_structure=project_structure,
@@ -73,7 +84,7 @@ class CodeGroundingAgent:
             current_candidates=initial_candidates,
             role_prompt=role_prompt,
             event_handler=event_handler,
-            max_runtime_sec=self.EXECUTION_BUDGET_SEC,
+            max_runtime_sec=execution_budget,
         )
         current_candidates = self._stabilize_candidates(
             initial_candidates,
@@ -116,7 +127,29 @@ class CodeGroundingAgent:
             current_candidates,
         ):
             return None
-        return reflected_result
+        return self._enrich_result(
+            reflected_result,
+            paper_section=paper_section,
+            current_candidates=current_candidates,
+            semantic_index=semantic_index,
+            project_structure=project_structure,
+        )
+
+    def _resolve_execution_budget(
+        self,
+        paper_section: PaperSection,
+        *,
+        code_evidences: tuple[CodeEvidence, ...],
+    ) -> float:
+        budget = self.EXECUTION_BUDGET_SEC
+        paper_text = paper_section.combined_text.lower()
+        if len(code_evidences) >= 300:
+            budget = min(budget, 14.0)
+        if self._is_topological_mapping_section(paper_section):
+            budget = min(budget, 12.0)
+        if any(term in paper_text for term in ("coarse-scale", "cross-modal", "encoder")):
+            budget = min(budget, 15.0)
+        return budget
 
     def _build_initial_candidates(
         self,
@@ -127,6 +160,10 @@ class CodeGroundingAgent:
         semantic_index: tuple[CodeSemanticSummary, ...],
     ) -> tuple[AlignmentCandidate, ...]:
         merged: dict[str, AlignmentCandidate] = {}
+        knowledge_index = CodeKnowledgeIndex(
+            semantic_index,
+            llm_client=self._llm_client,
+        )
 
         def collect(candidates: tuple[AlignmentCandidate, ...], score_boost: float = 0.0) -> None:
             for candidate in candidates:
@@ -151,21 +188,36 @@ class CodeGroundingAgent:
             *,
             lexical_boost: float = 0.0,
             semantic_boost: float = 0.0,
+            knowledge_boost: float = 0.0,
+            use_llm_rerank: bool = False,
         ) -> None:
             lexical_candidates = self._evidence_builder.build_alignment_candidates_from_inputs(
                 paper_sections=(section,),
                 code_evidences=code_evidences,
-                top_k=6,
+                top_k=12,
             )
             semantic_candidates = self._evidence_builder.retrieve_semantic_candidates(
                 section,
                 semantic_index,
-                top_k=6,
+                top_k=12,
+            )
+            knowledge_candidates = knowledge_index.search(
+                section,
+                focus_terms=code_focus,
+                top_k=10,
+                use_llm_rerank=use_llm_rerank,
             )
             collect(lexical_candidates, lexical_boost)
             collect(semantic_candidates, semantic_boost)
+            collect(knowledge_candidates, knowledge_boost)
 
-        collect_for_section(paper_section, lexical_boost=0.02, semantic_boost=0.12)
+        collect_for_section(
+            paper_section,
+            lexical_boost=0.02,
+            semantic_boost=0.12,
+            knowledge_boost=0.18,
+            use_llm_rerank=True,
+        )
         for focus in code_focus[:3]:
             synthetic_section = PaperSection(
                 title=paper_section.title,
@@ -175,7 +227,13 @@ class CodeGroundingAgent:
                 order=paper_section.order,
                 block_orders=paper_section.block_orders,
             )
-            collect_for_section(synthetic_section, lexical_boost=0.0, semantic_boost=0.09)
+            collect_for_section(
+                synthetic_section,
+                lexical_boost=0.0,
+                semantic_boost=0.09,
+                knowledge_boost=0.12,
+                use_llm_rerank=False,
+            )
 
         traced_symbols = self._extract_trace_symbols(code_focus, semantic_index, merged)
         if traced_symbols:
@@ -248,6 +306,700 @@ class CodeGroundingAgent:
             kind="observation",
             message="候选代码卡片：\n" + "\n".join(lines),
         )
+
+    def _enrich_result(
+        self,
+        result: AlignmentResult,
+        *,
+        paper_section: PaperSection,
+        current_candidates: tuple[AlignmentCandidate, ...],
+        semantic_index: tuple[CodeSemanticSummary, ...],
+        project_structure: str,
+    ) -> AlignmentResult:
+        ordered_candidates = self._order_candidates_for_guide(result, current_candidates)
+        source_guide = self._build_source_guide(
+            paper_section=paper_section,
+            current_candidates=ordered_candidates,
+            semantic_index=semantic_index,
+        )
+        project_structure_context = self._build_project_structure_context(
+            project_structure,
+            ordered_candidates,
+        )
+        return replace(
+            result,
+            source_guide=source_guide,
+            project_structure_context=project_structure_context,
+        )
+
+    def _order_candidates_for_guide(
+        self,
+        result: AlignmentResult,
+        current_candidates: tuple[AlignmentCandidate, ...],
+    ) -> tuple[AlignmentCandidate, ...]:
+        selected_id = f"{result.code_file_name}:{result.code_start_line}-{result.code_end_line}"
+        prioritized: list[AlignmentCandidate] = []
+        seen_ids: set[str] = set()
+        for candidate in current_candidates:
+            candidate_id = self._candidate_id(candidate)
+            if candidate_id == selected_id:
+                prioritized.append(candidate)
+                seen_ids.add(candidate_id)
+                break
+        for candidate in current_candidates:
+            candidate_id = self._candidate_id(candidate)
+            if candidate_id in seen_ids:
+                continue
+            prioritized.append(candidate)
+            seen_ids.add(candidate_id)
+        return tuple(prioritized)
+
+    def _build_source_guide(
+        self,
+        *,
+        paper_section: PaperSection,
+        current_candidates: tuple[AlignmentCandidate, ...],
+        semantic_index: tuple[CodeSemanticSummary, ...],
+    ) -> tuple[SourceGuideItem, ...]:
+        guide_candidates = self._select_guide_candidates(
+            paper_section=paper_section,
+            current_candidates=current_candidates,
+            semantic_index=semantic_index,
+        )
+        summary_lookup = {summary.identity: summary for summary in semantic_index}
+        guide_items: list[SourceGuideItem] = []
+        for candidate in guide_candidates[:4]:
+            evidence = candidate.code_evidence
+            summary = summary_lookup.get(self._candidate_id(candidate))
+            summary_text = self._build_guide_summary(
+                evidence,
+                semantic_summary=(summary.summary if summary is not None else ""),
+            )
+            responsibilities = (
+                tuple(item for item in summary.responsibilities[:3] if item.strip())
+                if summary is not None and summary.responsibilities
+                else self._build_guide_responsibilities(evidence)
+            )
+            guide_items.append(
+                SourceGuideItem(
+                    file_name=evidence.file_name,
+                    symbol_name=evidence.symbol_name or evidence.parent_symbol or "未命名逻辑块",
+                    block_type=evidence.block_type,
+                    start_line=evidence.start_line,
+                    end_line=evidence.end_line,
+                    summary=summary_text,
+                    responsibilities=responsibilities,
+                    relevance_reason=self._build_guide_relevance_reason(paper_section, evidence),
+                    code_preview=self._build_code_preview(evidence),
+                    retrieval_score=round(candidate.retrieval_score, 4),
+                )
+            )
+        return tuple(guide_items)
+
+    def _select_guide_candidates(
+        self,
+        *,
+        paper_section: PaperSection,
+        current_candidates: tuple[AlignmentCandidate, ...],
+        semantic_index: tuple[CodeSemanticSummary, ...],
+    ) -> tuple[AlignmentCandidate, ...]:
+        code_focus = self._derive_focus_terms(paper_section)
+        ordered_candidates = tuple(
+            sorted(
+                current_candidates,
+                key=lambda item: self._candidate_sort_key(
+                    item,
+                    paper_section=paper_section,
+                    code_focus=code_focus,
+                ),
+                reverse=True,
+            )
+        )
+        promoted_candidates: list[AlignmentCandidate] = []
+        seen_ids: set[str] = set()
+        for candidate in ordered_candidates:
+            promoted_candidate = self._promote_candidate_for_guide(
+                candidate,
+                paper_section=paper_section,
+                semantic_index=semantic_index,
+                code_focus=code_focus,
+            )
+            promoted_id = self._candidate_id(promoted_candidate)
+            if promoted_id in seen_ids:
+                continue
+            if self._is_trivial_helper_evidence(promoted_candidate.code_evidence):
+                continue
+            promoted_candidates.append(promoted_candidate)
+            seen_ids.add(promoted_id)
+        if promoted_candidates:
+            return tuple(promoted_candidates)
+        return ordered_candidates
+
+    def _promote_candidate_for_guide(
+        self,
+        candidate: AlignmentCandidate,
+        *,
+        paper_section: PaperSection,
+        semantic_index: tuple[CodeSemanticSummary, ...],
+        code_focus: tuple[str, ...],
+    ) -> AlignmentCandidate:
+        representative = self._resolve_representative_evidence(
+            candidate.code_evidence,
+            paper_section=paper_section,
+            semantic_index=semantic_index,
+            code_focus=code_focus,
+        )
+        if representative == candidate.code_evidence:
+            return candidate
+        return AlignmentCandidate(
+            paper_section=candidate.paper_section,
+            code_evidence=representative,
+            retrieval_score=candidate.retrieval_score,
+        )
+
+    def _resolve_representative_evidence(
+        self,
+        evidence: CodeEvidence,
+        *,
+        paper_section: PaperSection,
+        semantic_index: tuple[CodeSemanticSummary, ...],
+        code_focus: tuple[str, ...],
+    ) -> CodeEvidence:
+        symbol_name = (evidence.symbol_name or "").lower()
+        if (
+            evidence.block_type in {"method", "function"}
+            and not self._is_trivial_helper_evidence(evidence)
+            and not symbol_name.endswith(".__init__")
+        ):
+            return evidence
+
+        related_evidences = [evidence]
+        for summary in semantic_index:
+            candidate = summary.code_evidence
+            if candidate.file_name != evidence.file_name:
+                continue
+            if not self._belongs_to_same_guide_cluster(evidence, candidate):
+                continue
+            if candidate not in related_evidences:
+                related_evidences.append(candidate)
+        if self._is_trivial_helper_evidence(evidence):
+            for summary in semantic_index:
+                candidate = summary.code_evidence
+                if candidate.file_name != evidence.file_name:
+                    continue
+                if self._is_trivial_helper_evidence(candidate):
+                    continue
+                if candidate not in related_evidences:
+                    related_evidences.append(candidate)
+        best_evidence = max(
+            related_evidences,
+            key=lambda item: self._guide_representation_score(
+                item,
+                paper_section=paper_section,
+                code_focus=code_focus,
+            ),
+        )
+        if best_evidence.block_type == "class" and best_evidence.symbol_name:
+            child_candidates = [
+                candidate
+                for candidate in related_evidences
+                if candidate.parent_symbol == best_evidence.symbol_name
+                and candidate.block_type in {"method", "function"}
+                and not self._is_trivial_helper_evidence(candidate)
+            ]
+            non_init_children = [
+                candidate
+                for candidate in child_candidates
+                if not (candidate.symbol_name or "").lower().endswith(".__init__")
+            ]
+            if non_init_children:
+                child_candidates = non_init_children
+            if child_candidates:
+                return max(
+                    child_candidates,
+                    key=lambda item: self._guide_representation_score(
+                        item,
+                        paper_section=paper_section,
+                        code_focus=code_focus,
+                    ),
+                )
+        return best_evidence
+
+    def _belongs_to_same_guide_cluster(
+        self,
+        anchor: CodeEvidence,
+        candidate: CodeEvidence,
+    ) -> bool:
+        if anchor.file_name != candidate.file_name:
+            return False
+        if anchor == candidate:
+            return True
+
+        anchor_symbol = anchor.symbol_name or ""
+        anchor_parent = anchor.parent_symbol or ""
+        candidate_symbol = candidate.symbol_name or ""
+        candidate_parent = candidate.parent_symbol or ""
+
+        if anchor_parent:
+            return candidate_symbol == anchor_parent or candidate_parent == anchor_parent
+        if anchor.block_type == "class" and anchor_symbol:
+            return candidate_parent == anchor_symbol or candidate_symbol == anchor_symbol
+        if "." in anchor_symbol:
+            owner = anchor_symbol.split(".", 1)[0]
+            return candidate_parent == owner or candidate_symbol == owner
+        return False
+
+    def _guide_representation_score(
+        self,
+        evidence: CodeEvidence,
+        *,
+        paper_section: PaperSection,
+        code_focus: tuple[str, ...],
+    ) -> float:
+        span = max(1, evidence.end_line - evidence.start_line + 1)
+        score = (
+            self._compute_focus_alignment_score(
+                evidence,
+                paper_section=paper_section,
+                code_focus=code_focus,
+            )
+            * 2.0
+            + self._compute_mechanism_alignment_score(
+                evidence,
+                paper_section=paper_section,
+            )
+            * 3.0
+            + self._compute_specificity_score(
+                evidence,
+                paper_section=paper_section,
+            )
+        )
+        if evidence.block_type in {"method", "function"} and span >= 6:
+            score += 1.2
+        if evidence.block_type == "class":
+            score += 0.6
+        if evidence.block_type == "module_intro":
+            score -= 8.0
+        if (evidence.symbol_name or "").lower().endswith(".__init__"):
+            score -= 3.2
+        if evidence.file_name.lower().endswith("/env.py") or evidence.file_name.lower().endswith(
+            "\\env.py"
+        ):
+            score -= 4.0
+        if self._is_topological_mapping_section(paper_section):
+            lowered_symbol = (evidence.symbol_name or "").lower()
+            lowered_file = evidence.file_name.lower()
+            if any(
+                token in lowered_symbol
+                for token in ("teacher_action", "make_equiv_action", "rollout")
+            ):
+                score -= 10.0
+            if any(
+                token in lowered_file
+                for token in (
+                    "/r2r/agent.py",
+                    "\\r2r\\agent.py",
+                    "/reverie/agent",
+                    "\\reverie\\agent",
+                )
+            ):
+                score -= 6.0
+            if any(token in lowered_file for token in ("graph_utils.py", "vilmodel.py")):
+                score += 2.8
+            if any(
+                token in lowered_symbol
+                for token in ("update_graph", "get_pos_fts", "floydgraph.path", "graphmap")
+            ):
+                score += 3.2
+        if span <= 3:
+            score -= 4.0
+        if self._is_trivial_helper_evidence(evidence):
+            score -= 6.0
+        return score
+
+    def _build_project_structure_context(
+        self,
+        project_structure: str,
+        current_candidates: tuple[AlignmentCandidate, ...],
+    ) -> tuple[str, ...]:
+        normalized_paths = [
+            line.replace(" / ", "/").strip()
+            for line in project_structure.splitlines()
+            if line.strip()
+        ]
+        if not normalized_paths:
+            return ()
+
+        top_level_counts: dict[str, int] = {}
+        directory_counts: dict[str, int] = {}
+        for path in normalized_paths:
+            parts = [part for part in path.split("/") if part]
+            if not parts:
+                continue
+            top_level_counts[parts[0]] = top_level_counts.get(parts[0], 0) + 1
+            if len(parts) >= 2:
+                directory_key = "/".join(parts[:2])
+            else:
+                directory_key = parts[0]
+            directory_counts[directory_key] = directory_counts.get(directory_key, 0) + 1
+
+        top_level_summary = " / ".join(
+            f"{name}（{count}）"
+            for name, count in sorted(
+                top_level_counts.items(),
+                key=lambda item: (-item[1], item[0]),
+            )[:4]
+        )
+        context_lines = [f"项目主干目录：{top_level_summary}。"] if top_level_summary else []
+
+        seen_directories: set[str] = set()
+        for candidate in current_candidates[:3]:
+            directory_key = self._extract_directory_key(candidate.code_evidence.file_name)
+            if not directory_key or directory_key in seen_directories:
+                continue
+            seen_directories.add(directory_key)
+            file_count = directory_counts.get(directory_key, 1)
+            directory_role = self._describe_directory_role(directory_key)
+            context_lines.append(
+                f"{directory_key}：{directory_role}，当前目录共 {file_count} 个文件。"
+            )
+        return tuple(context_lines)
+
+    def _extract_directory_key(self, file_name: str) -> str:
+        parts = [part for part in file_name.split("/") if part]
+        if not parts:
+            return ""
+        if len(parts) >= 2:
+            return "/".join(parts[:2])
+        return parts[0]
+
+    def _describe_directory_role(self, directory_key: str) -> str:
+        normalized = directory_key.lower()
+        if "models" in normalized:
+            return "承载模型主干、编码层和核心机制实现"
+        if any(marker in normalized for marker in ("graph", "utils", "tool")):
+            return "承载图结构维护、工具函数与底层支撑逻辑"
+        if any(marker in normalized for marker in ("agent", "reverie", "r2r")):
+            return "承载任务级 Agent、动作决策与环境交互逻辑"
+        if "pretrain" in normalized:
+            return "承载预训练阶段的编码模块与共享组件"
+        if any(marker in normalized for marker in ("data", "dataset")):
+            return "承载数据读取、组织与预处理逻辑"
+        return "承载该方向下的相关实现"
+
+    def _build_guide_summary(self, evidence: CodeEvidence, *, semantic_summary: str = "") -> str:
+        code_text = evidence.code_snippet.lower()
+        symbol_text = (evidence.symbol_name or evidence.parent_symbol or "").lower()
+        if all(marker in code_text for marker in ("rel_angles", "rel_dists", "get_angle_fts")):
+            return (
+                "这段代码会遍历地图中的候选节点，计算相对朝向、距离和步数特征，"
+                "并把它们拼成位置特征向量返回。"
+            )
+        if "add_edge" in code_text and "node_positions" in code_text:
+            return (
+                "这段代码会把当前观测写回地图，更新节点位置，"
+                "并把当前节点与候选节点之间的边加入图结构。"
+            )
+        if "graph_sprels" in code_text and any(
+            marker in code_text for marker in ("visual_attention", "visn_self_att", "ctx_att_mask")
+        ):
+            return (
+                "这段代码负责这一层的前向传播：先让视觉特征和文本对齐，"
+                "再把图结构偏置并入注意力计算，输出更新后的跨模态表示。"
+            )
+        if "modulelist" in code_text and "graphlxrtxlayer" in code_text:
+            return (
+                "这个模块把多层跨模态编码层串起来，负责反复更新图节点表示与文本表示，"
+                "是编码器骨架的一部分。"
+            )
+        if "forward_navigation_per_step" in symbol_text:
+            return (
+                "这段代码负责单步导航决策：先分别算出全局地图分支和局部视角分支的表示，"
+                "再把两路动作分数融合成最终导航 logits，"
+                "并额外输出目标物体 grounding 所需的预测结果。"
+            )
+        if "gmap_input_embedding" in symbol_text:
+            return (
+                "这段代码负责生成全局地图节点的输入表示：先聚合同一节点的视觉特征，"
+                "再叠加导航步编码和位置编码，并生成后续图编码器要用的掩码。"
+            )
+        structured_summary = self._build_structured_behavior_summary(evidence)
+        if structured_summary:
+            return structured_summary
+        if evidence.docstring.strip():
+            return f"这段代码主要负责：{evidence.docstring.strip()}"
+        cleaned_summary = semantic_summary.strip()
+        if cleaned_summary:
+            return self._rewrite_semantic_summary_as_explanation(cleaned_summary, evidence)
+        symbol = evidence.symbol_name or evidence.parent_symbol or evidence.block_type
+        return f"这段代码主要围绕 `{symbol}` 展开，负责当前段落对应的这一段实现逻辑。"
+
+    def _build_structured_behavior_summary(self, evidence: CodeEvidence) -> str:
+        function_node = self._parse_python_function(evidence)
+        if function_node is None:
+            return ""
+
+        if function_node.name == "__init__":
+            return self._summarize_init_method(function_node, evidence)
+        if self._looks_like_path_reconstruction(function_node, evidence):
+            return self._summarize_path_reconstruction()
+        if self._looks_like_serialization(function_node, evidence):
+            return self._summarize_serialization(function_node)
+        return self._summarize_function_flow(function_node)
+
+    def _parse_python_function(
+        self,
+        evidence: CodeEvidence,
+    ) -> ast.FunctionDef | ast.AsyncFunctionDef | None:
+        snippet = evidence.code_snippet.strip()
+        if not snippet.startswith(("def ", "async def ")):
+            return None
+        try:
+            module = ast.parse(snippet)
+        except SyntaxError:
+            return None
+        if not module.body:
+            return None
+        first_node = module.body[0]
+        if isinstance(first_node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            return first_node
+        return None
+
+    def _summarize_init_method(
+        self,
+        function_node: ast.FunctionDef | ast.AsyncFunctionDef,
+        evidence: CodeEvidence,
+    ) -> str:
+        attributes = self._extract_self_attributes(function_node)
+        display_attrs = (
+            "、".join(f"`{name}`" for name in attributes[:4]) if attributes else "类成员状态"
+        )
+        if any(
+            marker in attributes
+            for marker in ("graph", "node_positions", "node_embeds", "node_nav_scores")
+        ):
+            purpose = "后续写入观测、更新图边与维护节点状态做准备"
+        else:
+            purpose = "后续调用和状态更新做准备"
+        owner = evidence.parent_symbol or "当前类"
+        return (
+            f"这段代码在初始化 `{owner}` 的运行时状态，建立 {display_attrs} 等成员，为{purpose}。"
+        )
+
+    def _looks_like_path_reconstruction(
+        self,
+        function_node: ast.FunctionDef | ast.AsyncFunctionDef,
+        evidence: CodeEvidence,
+    ) -> bool:
+        code_text = evidence.code_snippet.lower()
+        return function_node.name == "path" and code_text.count("self.path(") >= 2
+
+    def _summarize_path_reconstruction(self) -> str:
+        return (
+            "这段代码会根据图里记录的中间节点递归还原从 x 到 y 的路径："
+            "如果两点直接相连就直接返回终点，否则把路径拆成两段再拼接起来。"
+        )
+
+    def _looks_like_serialization(
+        self,
+        function_node: ast.FunctionDef | ast.AsyncFunctionDef,
+        evidence: CodeEvidence,
+    ) -> bool:
+        lowered_name = function_node.name.lower()
+        code_text = evidence.code_snippet.lower()
+        return (
+            any(marker in lowered_name for marker in ("save", "dump", "serialize"))
+            or "json" in lowered_name
+            or "json" in code_text
+        )
+
+    def _summarize_serialization(
+        self,
+        function_node: ast.FunctionDef | ast.AsyncFunctionDef,
+    ) -> str:
+        attributes = self._extract_self_attributes(
+            function_node
+        ) + self._extract_referenced_self_attributes(function_node)
+        interesting_attrs = [
+            name
+            for name in attributes
+            if any(flag in name for flag in ("node", "edge", "graph", "score", "visited"))
+        ]
+        if interesting_attrs:
+            display_attrs = "、".join(f"`{name}`" for name in interesting_attrs[:4])
+            return (
+                f"这段代码会把 {display_attrs} 等图状态整理成可保存的结构，"
+                "方便导出、调试或复现当前运行结果。"
+            )
+        return "这段代码会把当前对象的关键信息整理成可保存的结构，方便后续导出、调试或复现。"
+
+    def _summarize_function_flow(
+        self,
+        function_node: ast.FunctionDef | ast.AsyncFunctionDef,
+    ) -> str:
+        loop_targets = self._extract_loop_targets(function_node)
+        called_symbols = self._extract_called_symbols_from_ast(function_node)
+        return_names = self._extract_return_names(function_node)
+
+        parts: list[str] = []
+        if loop_targets:
+            display_targets = "、".join(f"`{name}`" for name in loop_targets[:2])
+            parts.append(f"遍历 {display_targets}")
+        if called_symbols:
+            display_calls = "、".join(f"`{name}`" for name in called_symbols[:3])
+            parts.append(f"调用 {display_calls}")
+        if return_names:
+            display_returns = "、".join(f"`{name}`" for name in return_names[:2])
+            parts.append(f"最后返回 {display_returns}")
+
+        if not parts:
+            return ""
+        return "这段代码会先" + "，再".join(parts[:3]) + "。"
+
+    def _rewrite_semantic_summary_as_explanation(
+        self,
+        semantic_summary: str,
+        evidence: CodeEvidence,
+    ) -> str:
+        lowered = semantic_summary.lower()
+        if "定义了" in semantic_summary or "调用了" in semantic_summary:
+            called_symbols = ", ".join(self._extract_called_symbols(evidence)[:4])
+            if called_symbols:
+                symbol = evidence.symbol_name or evidence.parent_symbol or evidence.block_type
+                return (
+                    f"这段代码主要围绕 `{symbol}` 展开，"
+                    f"会调用 {called_symbols} 等逻辑来完成当前这一步。"
+                )
+        if lowered.startswith(evidence.file_name.lower()):
+            symbol = evidence.symbol_name or evidence.parent_symbol or evidence.block_type
+            return f"这段代码位于 `{evidence.file_name}`，主要承担 `{symbol}` 这一层逻辑。"
+        return semantic_summary
+
+    def _extract_called_symbols(self, evidence: CodeEvidence) -> tuple[str, ...]:
+        called_symbols: list[str] = []
+        for line in evidence.code_snippet.splitlines():
+            stripped = line.strip()
+            if "(" not in stripped or stripped.startswith(("def ", "class ", "#")):
+                continue
+            candidate = stripped.split("(", 1)[0].split()[-1].strip()
+            candidate = candidate.split(".")[-1]
+            if len(candidate) < 2:
+                continue
+            if candidate not in called_symbols:
+                called_symbols.append(candidate)
+        return tuple(called_symbols)
+
+    def _extract_self_attributes(
+        self,
+        function_node: ast.FunctionDef | ast.AsyncFunctionDef,
+    ) -> tuple[str, ...]:
+        attributes: list[str] = []
+        for node in ast.walk(function_node):
+            if not isinstance(node, ast.Assign):
+                continue
+            for target in node.targets:
+                if (
+                    isinstance(target, ast.Attribute)
+                    and isinstance(target.value, ast.Name)
+                    and target.value.id == "self"
+                    and target.attr not in attributes
+                ):
+                    attributes.append(target.attr)
+        return tuple(attributes)
+
+    def _extract_loop_targets(
+        self,
+        function_node: ast.FunctionDef | ast.AsyncFunctionDef,
+    ) -> tuple[str, ...]:
+        targets: list[str] = []
+        for node in ast.walk(function_node):
+            if isinstance(node, ast.For):
+                target_name = self._format_name(node.iter)
+                if target_name and target_name not in targets:
+                    targets.append(target_name)
+        return tuple(targets)
+
+    def _extract_referenced_self_attributes(
+        self,
+        function_node: ast.FunctionDef | ast.AsyncFunctionDef,
+    ) -> tuple[str, ...]:
+        attributes: list[str] = []
+        for node in ast.walk(function_node):
+            if (
+                isinstance(node, ast.Attribute)
+                and isinstance(node.value, ast.Name)
+                and node.value.id == "self"
+                and node.attr not in attributes
+            ):
+                attributes.append(node.attr)
+        return tuple(attributes)
+
+    def _extract_called_symbols_from_ast(
+        self,
+        function_node: ast.FunctionDef | ast.AsyncFunctionDef,
+    ) -> tuple[str, ...]:
+        called_symbols: list[str] = []
+        for node in ast.walk(function_node):
+            if not isinstance(node, ast.Call):
+                continue
+            name = self._format_name(node.func)
+            if not name:
+                continue
+            symbol = name.split(".")[-1]
+            if symbol not in called_symbols:
+                called_symbols.append(symbol)
+        return tuple(called_symbols)
+
+    def _extract_return_names(
+        self,
+        function_node: ast.FunctionDef | ast.AsyncFunctionDef,
+    ) -> tuple[str, ...]:
+        return_names: list[str] = []
+        for node in ast.walk(function_node):
+            if not isinstance(node, ast.Return) or node.value is None:
+                continue
+            for child in ast.walk(node.value):
+                if isinstance(child, ast.Name) and child.id not in return_names:
+                    return_names.append(child.id)
+        return tuple(return_names)
+
+    def _format_name(self, node: ast.AST) -> str:
+        if isinstance(node, ast.Name):
+            return node.id
+        if isinstance(node, ast.Attribute):
+            parent = self._format_name(node.value)
+            return f"{parent}.{node.attr}" if parent else node.attr
+        if isinstance(node, ast.Call):
+            return self._format_name(node.func)
+        if isinstance(node, ast.Subscript):
+            return self._format_name(node.value)
+        return ""
+
+    def _build_guide_responsibilities(self, evidence: CodeEvidence) -> tuple[str, ...]:
+        responsibilities: list[str] = []
+        if evidence.parent_symbol:
+            responsibilities.append(f"挂在 `{evidence.parent_symbol}` 这一层级下。")
+        if evidence.docstring.strip():
+            responsibilities.append(evidence.docstring.strip())
+        elif evidence.symbol_name:
+            responsibilities.append(f"核心符号是 `{evidence.symbol_name}`。")
+        responsibilities.append(
+            f"代码范围位于 L{evidence.start_line}-L{evidence.end_line}，适合继续沿调用链复核。"
+        )
+        return tuple(responsibilities[:3])
+
+    def _build_guide_relevance_reason(
+        self,
+        paper_section: PaperSection,
+        evidence: CodeEvidence,
+    ) -> str:
+        return self._build_module_match_reason(paper_section, evidence)
+
+    def _build_code_preview(self, evidence: CodeEvidence) -> str:
+        preview_lines = [
+            line.rstrip() for line in evidence.code_snippet.splitlines() if line.strip()
+        ]
+        return "\n".join(preview_lines[:8])
 
     def _build_final_answer(
         self,
@@ -378,7 +1130,7 @@ class CodeGroundingAgent:
         paper_section: PaperSection,
         evidence: CodeEvidence,
     ) -> bool:
-        paper_text = paper_section.combined_text.lower()
+        paper_text = paper_section.combined_text
         code_text = evidence.combined_text.lower()
         anchors = (
             "attention",
@@ -420,10 +1172,18 @@ class CodeGroundingAgent:
         step_traces: tuple[StepExecutionTrace, ...],
         current_plan: ExecutionPlan,
     ) -> AlignmentResult:
-        candidate = current_candidates[0]
+        code_focus = self._derive_focus_terms(paper_section)
+        candidate = sorted(
+            current_candidates,
+            key=lambda item: self._candidate_sort_key(
+                item,
+                paper_section=paper_section,
+                code_focus=code_focus,
+            ),
+            reverse=True,
+        )[0]
         evidence = candidate.code_evidence
         plan_steps = current_plan.steps or tuple(trace.step for trace in step_traces)
-        symbol = evidence.symbol_name or evidence.block_type
         return AlignmentResult(
             paper_section_title=paper_section.title,
             code_file_name=evidence.file_name,
@@ -476,7 +1236,7 @@ class CodeGroundingAgent:
         paper_section: PaperSection,
         evidence: CodeEvidence,
     ) -> str:
-        paper_text = paper_section.combined_text.lower()
+        paper_text = paper_section.combined_text
         code_text = evidence.code_snippet.lower()
         if "softmax" in paper_text and "softmax" in code_text:
             return "论文里的 softmax 在代码中找到了直接对应的 softmax 算子。"
@@ -513,12 +1273,16 @@ class CodeGroundingAgent:
         *,
         paper_section: PaperSection,
         code_focus: tuple[str, ...],
-    ) -> tuple[float, float, float]:
+    ) -> tuple[float, float, float, float]:
         return (
             self._compute_focus_alignment_score(
                 candidate.code_evidence,
                 paper_section=paper_section,
                 code_focus=code_focus,
+            ),
+            self._compute_mechanism_alignment_score(
+                candidate.code_evidence,
+                paper_section=paper_section,
             ),
             self._compute_specificity_score(
                 candidate.code_evidence,
@@ -526,6 +1290,42 @@ class CodeGroundingAgent:
             ),
             candidate.retrieval_score,
         )
+
+    def _derive_focus_terms(self, paper_section: PaperSection) -> tuple[str, ...]:
+        paper_text = f"{paper_section.title} {paper_section.combined_text}".lower()
+        focus_terms: list[str] = []
+        phrases = (
+            "topological map",
+            "global action planning",
+            "global planning",
+            "coarse-scale",
+            "fine-scale",
+            "cross-modal",
+            "graph-aware",
+            "position encoding",
+            "visited nodes",
+            "navigable nodes",
+            "current node",
+            "pair-wise distance matrix",
+            "graph structure",
+        )
+        for phrase in phrases:
+            if phrase in paper_text and phrase not in focus_terms:
+                focus_terms.append(phrase)
+        single_terms = (
+            "navigable",
+            "global",
+            "local",
+            "attention",
+            "encoder",
+            "position",
+            "distance",
+            "heading",
+        )
+        for token in single_terms:
+            if token in paper_text and token not in focus_terms:
+                focus_terms.append(token)
+        return tuple(focus_terms)
 
     def _stabilize_candidates(
         self,
@@ -550,8 +1350,71 @@ class CodeGroundingAgent:
                     code_focus=code_focus,
                 ),
                 reverse=True,
-            )[:6]
+            )[:10]
         )
+
+    def _compute_mechanism_alignment_score(
+        self,
+        evidence: CodeEvidence,
+        *,
+        paper_section: PaperSection,
+    ) -> float:
+        paper_text = paper_section.combined_text.lower()
+        symbol = (evidence.symbol_name or evidence.parent_symbol or evidence.block_type).lower()
+        searchable = " ".join(
+            part
+            for part in (
+                evidence.file_name,
+                evidence.symbol_name,
+                evidence.parent_symbol,
+                evidence.docstring,
+                evidence.code_snippet[:600],
+            )
+            if part
+        ).lower()
+        score = 0.0
+
+        if any(
+            term in paper_text
+            for term in (
+                "topological map",
+                "visited nodes",
+                "navigable nodes",
+                "current node",
+                "update et",
+                "neighboring unvisited nodes",
+            )
+        ):
+            if "graphmap.update_graph" in symbol or " update_graph(" in searchable:
+                score += 8.4
+            elif any(
+                term in searchable
+                for term in ("add_edge", "self.graph.update(", "node_positions", "candidate")
+            ):
+                score += 5.2
+            if symbol == "graphmap":
+                score += 5.0
+            if symbol.endswith(".__init__"):
+                score += 3.8
+            if any(term in symbol for term in ("get_pos_fts", "calculate_vp_rel_pos_fts")):
+                score += 2.6
+            if symbol == "floydgraph":
+                score += 1.8
+            if "save_to_json" in symbol:
+                score -= 4.2
+            if symbol.endswith(".path") and not any(
+                term in paper_text for term in ("path", "route", "shortest")
+            ):
+                score -= 3.4
+            if symbol.endswith(".visited") and "visited node" in paper_text:
+                score -= 3.0
+            if any(
+                term in evidence.file_name.lower()
+                for term in ("/agent", "\\agent", "/reverie/", "\\reverie\\")
+            ):
+                score -= 2.8
+
+        return score
 
     def _compute_focus_alignment_score(
         self,
@@ -581,14 +1444,42 @@ class CodeGroundingAgent:
                 score += 2.5
 
         if any(term in paper_text for term in ("global action planning", "global planning")):
-            if any(term in searchable for term in ("global", "gmap", "graph_sprels", "global_encoder")):
+            if any(
+                term in searchable for term in ("global", "gmap", "graph_sprels", "global_encoder")
+            ):
                 score += 5.0
         if any(term in paper_text for term in ("graph", "graph-aware", "topological map", "map")):
             if any(
                 term in searchable
-                for term in ("graph", "gmap", "graphmap", "floydgraph", "graph_sprels", "topological")
+                for term in (
+                    "graph",
+                    "gmap",
+                    "graphmap",
+                    "floydgraph",
+                    "graph_sprels",
+                    "topological",
+                )
             ):
                 score += 5.0
+        if self._is_topological_mapping_section(paper_section):
+            if any(
+                term in searchable
+                for term in (
+                    "update_graph",
+                    "node_positions",
+                    "add_edge",
+                    "candidate",
+                    "get_pos_fts",
+                )
+            ):
+                score += 6.0
+            if any(
+                term in searchable
+                for term in ("teacher_action", "make_equiv_action", "rollout", "imitation_learning")
+            ):
+                score -= 8.0
+        if evidence.block_type == "module_intro":
+            score -= 6.0
         if "coarse-scale" in paper_text and any(
             term in searchable for term in ("global", "graph", "coarse", "gmap")
         ):
@@ -600,7 +1491,8 @@ class CodeGroundingAgent:
         if "attention" in paper_text and "attention" in searchable:
             score += 1.5
         if any(term in paper_text for term in ("encoder", "cross-modal", "graph-aware")) and (
-            "/models/" in evidence.file_name.lower() or evidence.file_name.lower().startswith("models/")
+            "/models/" in evidence.file_name.lower()
+            or evidence.file_name.lower().startswith("models/")
         ):
             score += 3.0
 
@@ -608,6 +1500,28 @@ class CodeGroundingAgent:
             term in searchable for term in ("bertselfattention", "transformer class", "adamw")
         ):
             score -= 2.0
+        if any(
+            term in paper_text
+            for term in (
+                "topological map",
+                "topological mapping",
+                "visited nodes",
+                "navigable nodes",
+            )
+        ) and any(
+            term in evidence.file_name.lower()
+            for term in (
+                "/agent",
+                "\\agent",
+                "/reverie/",
+                "\\reverie\\",
+                "/parser",
+                "\\parser\\",
+                "/env.py",
+                "\\env.py",
+            )
+        ):
+            score -= 2.6
         if any(term in paper_text for term in ("encoder", "cross-modal", "coarse-scale")) and any(
             term in searchable
             for term in (
@@ -636,12 +1550,16 @@ class CodeGroundingAgent:
         span = max(1, evidence.end_line - evidence.start_line + 1)
         score = 0.0
 
-        if span <= 24:
-            score += 2.2
-        elif span <= 80:
-            score += 1.4
-        elif span <= 160:
-            score += 0.6
+        if self._is_trivial_helper_evidence(evidence):
+            score -= 3.4
+        elif span <= 12:
+            score += 0.2
+        elif span <= 48:
+            score += 1.6
+        elif span <= 120:
+            score += 1.0
+        elif span <= 200:
+            score += 0.4
         elif span >= 260:
             score -= 1.6
 
@@ -655,8 +1573,81 @@ class CodeGroundingAgent:
             term in file_name for term in ("graph_utils", "vilmodel", "transformer")
         ):
             score += 1.0
+        if self._is_topological_mapping_section(paper_section):
+            if any(term in file_name for term in ("graph_utils", "vilmodel")):
+                score += 2.6
+            if any(
+                term in file_name
+                for term in (
+                    "/r2r/agent.py",
+                    "\\r2r\\agent.py",
+                    "/reverie/agent",
+                    "\\reverie\\agent",
+                )
+            ):
+                score -= 4.0
+            if any(
+                term in (evidence.symbol_name or "").lower()
+                for term in ("teacher_action", "rollout", "make_equiv_action")
+            ):
+                score -= 6.0
 
         return score
+
+    def _is_topological_mapping_section(self, paper_section: PaperSection) -> bool:
+        text = paper_section.combined_text.lower()
+        return any(
+            term in text
+            for term in (
+                "topological mapping",
+                "topological map",
+                "graph updating",
+                "visited nodes",
+                "navigable nodes",
+            )
+        )
+
+    def _is_trivial_helper_evidence(self, evidence: CodeEvidence) -> bool:
+        if evidence.block_type not in {"method", "function"}:
+            return False
+
+        span = max(1, evidence.end_line - evidence.start_line + 1)
+        symbol = (evidence.symbol_name or "").lower()
+        snippet_lines = [
+            line.strip()
+            for line in evidence.code_snippet.splitlines()
+            if line.strip() and not line.strip().startswith("#")
+        ]
+        body_lines = [line for line in snippet_lines if not line.startswith(("def ", "async def "))]
+        lowered_body = " ".join(body_lines).lower()
+
+        if span <= 3:
+            return True
+
+        if len(body_lines) <= 2 and lowered_body.startswith("return "):
+            return True
+
+        trivial_prefixes = ("is_", "has_", "get_", "visited", "distance", "path")
+        if span <= 5 and any(part in symbol for part in trivial_prefixes):
+            if "update_graph" not in symbol and "get_pos_fts" not in symbol:
+                return True
+
+        if span <= 6 and all(
+            token not in lowered_body
+            for token in (
+                "for ",
+                "while ",
+                "append(",
+                "add_edge",
+                "graph_sprels",
+                "concatenate",
+                "stack(",
+            )
+        ):
+            if lowered_body.count("return ") <= 1:
+                return True
+
+        return False
 
     def _build_grounded_implementation_chain(
         self,
@@ -687,22 +1678,158 @@ class CodeGroundingAgent:
         paper_section: PaperSection,
         evidence: CodeEvidence,
     ) -> str:
-        paper_text = paper_section.combined_text.lower()
+        paper_text = paper_section.combined_text
+        lowered_paper_text = paper_text.lower()
         searchable = " ".join(
             part
-            for part in (evidence.file_name, evidence.symbol_name, evidence.docstring, evidence.code_snippet[:400])
+            for part in (
+                evidence.file_name,
+                evidence.symbol_name,
+                evidence.docstring,
+                evidence.code_snippet[:400],
+            )
             if part
         ).lower()
-        if any(term in paper_text for term in ("graph", "global planning", "topological map")) and any(
-            term in searchable
-            for term in ("graph", "gmap", "graphmap", "graph_sprels", "global_encoder", "floydgraph")
+        explicit_reason = self._build_explicit_relation_reason(
+            paper_text,
+            lowered_paper_text,
+            evidence,
+            searchable,
+        )
+        return explicit_reason
+
+    def _build_explicit_relation_reason(
+        self,
+        paper_text: str,
+        lowered_paper_text: str,
+        evidence: CodeEvidence,
+        searchable: str,
+    ) -> str:
+        symbol = evidence.symbol_name or evidence.parent_symbol or evidence.block_type
+        symbol_lower = symbol.lower()
+        relation_rules = (
+            (
+                ("get_pos_fts",),
+                (
+                    "position encoding",
+                    "relative to the current node",
+                    "heading and distance",
+                    "location",
+                ),
+                "负责把候选节点相对当前位置的方位、距离和步数编码成位置特征",
+                "所以它对应的就是论文里“节点如何带上位置编码”这一步。",
+            ),
+            (
+                ("graphlxrtxlayer.forward", "graphlxrtxlayer"),
+                (
+                    "graph-aware",
+                    "pair-wise distance matrix",
+                    "graph structure",
+                    "global action space",
+                ),
+                "负责把图结构偏置并入跨模态注意力计算",
+                "所以它对应的是论文里图感知自注意力和粗尺度跨模态编码那部分机制。",
+            ),
+            (
+                ("crossmodalencoder", "graphlxrtxlayer"),
+                ("multi-layer", "graph-aware cross-modal transformer", "cross-attention layer"),
+                "负责把多层跨模态编码层串起来并反复更新节点与文本表示",
+                "所以它对应的是论文里多层图感知跨模态 Transformer 的整体编码骨架。",
+            ),
+            (
+                ("save_to_json",),
+                ("visited", "navigable", "map", "node"),
+                "把地图里的节点、得分和图连接状态整理成可导出的结构",
+                "虽然论文不会直接写导出函数，但它把论文里的地图状态变成了可检查的数据表示。",
+            ),
+            (
+                ("update_graph",),
+                ("topological map", "visited", "navigable", "builds its own map", "graph updating"),
+                "负责把新的观测写回地图、更新节点位置并补齐节点之间的边",
+                "所以它对应的是论文里“在线更新拓扑图”的实现部分。",
+            ),
+            (
+                ("floydgraph.path",),
+                ("topological map", "global action space", "visited", "navigable"),
+                "负责按图里的中间节点递归还原路径",
+                "它不是论文里的主机制本身，但支撑了全局规划里依赖的图路径计算。",
+            ),
+        )
+
+        for symbol_markers, paper_markers, code_role, relation_tail in relation_rules:
+            if not any(marker in symbol_lower for marker in symbol_markers):
+                continue
+            quote = self._extract_paper_quote(paper_text, paper_markers)
+            if quote:
+                return f"论文中“{quote}”提到了这一步，而 `{symbol}` {code_role}，{relation_tail}"
+            if any(marker in lowered_paper_text for marker in paper_markers):
+                return f"`{symbol}` {code_role}，{relation_tail}"
+        return ""
+
+    def _extract_paper_quote(self, paper_text: str, keywords: tuple[str, ...]) -> str:
+        sentences = [
+            sentence.strip()
+            for sentence in re.split(r"(?<=[.!?。；;])\s+|\n+", paper_text)
+            if sentence.strip()
+        ]
+        if not sentences:
+            return ""
+
+        best_sentence = ""
+        best_score = float("-inf")
+        for sentence in sentences:
+            score = self._score_paper_quote_sentence(sentence, keywords)
+            if score > best_score:
+                best_sentence = sentence
+                best_score = score
+
+        if not best_sentence or best_score <= 0:
+            return ""
+        return self._shorten_quote(best_sentence)
+
+    def _score_paper_quote_sentence(self, sentence: str, keywords: tuple[str, ...]) -> float:
+        normalized = " ".join(sentence.split())
+        lowered = normalized.lower()
+        keyword_hits = sum(1 for keyword in keywords if keyword in lowered)
+        if keyword_hits == 0:
+            return -1.0
+
+        score = float(keyword_hits * 6)
+        word_count = len(normalized.split())
+        char_count = len(normalized)
+        if self._looks_like_heading_sentence(normalized):
+            score -= 9.0
+        if word_count < 6:
+            score -= 5.0
+        elif 8 <= word_count <= 40:
+            score += 2.5
+        if 40 <= char_count <= 220:
+            score += 1.5
+        if any(
+            token in lowered
+            for token in (" we ", " model ", " node", " map", " graph", " attention")
         ):
-            return "它命中的是图结构或全局规划相关实现，不是单纯的通用注意力壳层。"
-        if "attention" in paper_text and any(
-            marker in searchable for marker in ("attention", "q_proj", "k_proj", "v_proj")
-        ):
-            return "它命中的是注意力计算相关实现，和论文里的跨模态编码细节有直接机制重叠。"
-        return "这段逻辑块在模块职责和语义关键词上，和当前论文片段最接近。"
+            score += 1.0
+        return score
+
+    def _looks_like_heading_sentence(self, sentence: str) -> bool:
+        normalized = sentence.strip()
+        if not normalized:
+            return True
+        if re.fullmatch(r"[\d.]+\s*[A-Za-z][A-Za-z0-9\- ]*", normalized):
+            return True
+        if re.fullmatch(r"(section|sec\.?)\s*[\d.]+.*", normalized, flags=re.IGNORECASE):
+            return True
+        words = normalized.split()
+        if len(words) <= 4 and all(word[:1].isupper() or word.isdigit() for word in words):
+            return True
+        return False
+
+    def _shorten_quote(self, sentence: str, limit: int = 160) -> str:
+        normalized = " ".join(sentence.split())
+        if len(normalized) <= limit:
+            return normalized
+        return normalized[: limit - 1].rstrip(" ,，。;；") + "…"
 
     def _build_local_chain_reason(
         self,
@@ -713,11 +1840,14 @@ class CodeGroundingAgent:
             return f"从这段逻辑块的说明看，它主要负责：{evidence.docstring.strip()}"
         operator_alignment = self._build_operator_alignment(paper_section, evidence)
         shape_alignment = self._build_shape_alignment(paper_section, evidence)
-        return " ".join(
-            item
-            for item in (operator_alignment, shape_alignment)
-            if item and "仍需要人工复核" not in item
-        ) or "当前先用这段代码作为最接近的实现入口，建议继续沿调用链往上追定义来源。"
+        return (
+            " ".join(
+                item
+                for item in (operator_alignment, shape_alignment)
+                if item and "仍需要人工复核" not in item
+            )
+            or "当前先用这段代码作为最接近的实现入口，建议继续沿调用链往上追定义来源。"
+        )
 
     def _is_chain_consistent_with_evidence(
         self,

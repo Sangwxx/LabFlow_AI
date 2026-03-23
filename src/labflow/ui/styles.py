@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import streamlit as st
 
-
 APP_STYLES = """
 <style>
     html, body, [class*="css"] { font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; }
@@ -48,6 +47,24 @@ APP_STYLES = """
     .source-overview-meta { color: #59697a; font-size: 0.92rem; margin-bottom: 0.35rem; }
     .source-overview-title { color: #1a2b3d; font-size: 1rem; font-weight: 700; line-height: 1.5; margin-bottom: 0.45rem; }
     .source-overview-body { color: #4d6072; font-size: 0.95rem; line-height: 1.7; }
+    .source-overview-shell { display: grid; gap: 0.9rem; margin-bottom: 0.85rem; }
+    .source-meta-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 0.7rem; }
+    .source-meta-card, .source-structure-shell, .source-guide-shell, .source-detail-block { border-radius: 18px; border: 1px solid rgba(31, 43, 61, 0.08); background: rgba(248, 250, 252, 0.96); }
+    .source-meta-card { padding: 0.9rem 0.95rem; }
+    .source-meta-label { color: #7a8a99; font-size: 0.82rem; margin-bottom: 0.3rem; }
+    .source-meta-value { color: #1d3145; font-size: 0.98rem; font-weight: 700; line-height: 1.4; word-break: break-word; }
+    .source-section-title, .source-detail-title { color: #1d3145; font-size: 0.96rem; font-weight: 700; margin-bottom: 0.55rem; }
+    .source-structure-shell, .source-guide-shell, .source-detail-block { padding: 0.95rem 1rem; }
+    .source-structure-item { color: #53677a; font-size: 0.92rem; line-height: 1.7; padding: 0.3rem 0; border-top: 1px solid rgba(31, 43, 61, 0.06); }
+    .source-structure-item:first-of-type { border-top: 0; padding-top: 0; }
+    .source-guide-shell { display: grid; gap: 0.55rem; }
+    .source-guide-card { padding: 0.8rem 0.9rem; border-radius: 14px; background: rgba(244, 239, 231, 0.55); border: 1px solid rgba(157, 137, 113, 0.16); }
+    .source-guide-meta { display: flex; flex-wrap: wrap; gap: 0.45rem 0.7rem; margin-bottom: 0.38rem; }
+    .source-guide-symbol { color: #1a2b3d; font-size: 0.93rem; font-weight: 700; }
+    .source-guide-range { color: #7a6a58; font-size: 0.84rem; }
+    .source-guide-summary, .source-detail-body { color: #53677a; font-size: 0.92rem; line-height: 1.7; }
+    .source-guide-reason { color: #6a7b8a; font-size: 0.86rem; line-height: 1.6; margin-top: 0.32rem; }
+    @media (max-width: 900px) { .source-meta-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
     .highlight-code-shell { border-radius: 22px; overflow: hidden; border: 1px solid rgba(20, 32, 46, 0.1); background: #f4efe7; }
     .highlight-code-scroll { overflow-x: auto; overflow-y: auto; max-height: 52rem; }
     .highlight-code-table { width: 100%; border-collapse: collapse; table-layout: fixed; }

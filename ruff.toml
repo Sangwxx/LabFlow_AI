@@ -5,3 +5,9 @@ extend-exclude = [".git", ".tmp", ".tools"]
 
 [lint]
 select = ["B", "E", "F", "I", "UP"]
+
+[lint.per-file-ignores]
+"src/labflow/ui/styles.py" = ["E501"]
+"tests/unit/test_code_grounding_agent.py" = ["E501"]
+"tests/unit/test_code_knowledge_index.py" = ["E501"]
+"tests/unit/test_source_guide_summary.py" = ["E501"]
