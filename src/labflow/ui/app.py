@@ -32,6 +32,7 @@ from labflow.ui.quick_guide import (
     LandingQuickGuide,
     LandingQuickGuideState,
     build_landing_quick_guide,
+    coerce_landing_quick_guide,
 )
 from labflow.ui.repo_preview import LandingRepoPreview, build_landing_repo_preview
 from labflow.ui.sidebar import SidebarState, render_sidebar
@@ -405,7 +406,8 @@ def load_landing_quick_guide(
         except RuntimeError:
             llm_client = None
 
-    return build_landing_quick_guide(preview, llm_client=llm_client)
+    guide = build_landing_quick_guide(preview, llm_client=llm_client)
+    return coerce_landing_quick_guide(guide, preview)
 
 
 @st.cache_data(show_spinner=False)

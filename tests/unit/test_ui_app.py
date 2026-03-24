@@ -373,7 +373,7 @@ def test_build_landing_quick_guide_state_returns_generated_guide(monkeypatch) ->
     )
 
     assert state.guide is not None
-    assert "先用一屏内容抓住问题" in state.guide.headline
+    assert "双尺度图 Transformer" in state.guide.headline
 
 
 def test_get_selected_section_supports_initial_silent_state() -> None:

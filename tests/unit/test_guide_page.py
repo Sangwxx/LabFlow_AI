@@ -1,11 +1,10 @@
 """独立论文导读页相关测试。"""
 
 from labflow.ui.guide_page import (
+    build_guide_page_overview_html,
     build_quick_guide_page_header_html,
-    build_quick_guide_reading_steps,
 )
 from labflow.ui.paper_preview import LandingPaperPreview
-from labflow.ui.quick_guide import LandingQuickGuide
 
 
 def build_preview() -> LandingPaperPreview:
@@ -31,31 +30,11 @@ def test_build_quick_guide_page_header_html_contains_title_and_source() -> None:
     assert "LabFlow" in html
 
 
-def test_build_quick_guide_reading_steps_prefers_generated_guide() -> None:
-    """如果已有导读结论，阅读建议应优先复用导读页生成内容。"""
+def test_build_guide_page_overview_html_hides_raw_abstract() -> None:
+    """导读页论文概览不应把原始英文摘要直接当正文展示。"""
 
-    steps = build_quick_guide_reading_steps(
-        preview=build_preview(),
-        guide=LandingQuickGuide(
-            headline="一屏看懂论文主线。",
-            problem="先理解它要解决的导航问题。",
-            method="再看双尺度图结构如何拆分建图和决策。",
-            focus="最后重点读方法图和 3.1/3.2 两节。",
-        ),
-    )
+    html = build_guide_page_overview_html(build_preview())
 
-    assert steps == (
-        "先确认：先理解它要解决的导航问题。",
-        "接着理解：再看双尺度图结构如何拆分建图和决策。",
-        "最后重点追踪：最后重点读方法图和 3.1/3.2 两节。",
-    )
-
-
-def test_build_quick_guide_reading_steps_has_fallback_steps() -> None:
-    """没有导读结论时，导读页也应保留稳定的阅读顺序建议。"""
-
-    steps = build_quick_guide_reading_steps(preview=build_preview(), guide=None)
-
-    assert len(steps) == 3
-    assert "Think Global, Act Local" in steps[0]
-    assert "进入工作区" in steps[2]
+    assert "Think Global, Act Local" in html
+    assert "Author A" in html
+    assert "A dual-scale graph transformer is introduced for navigation." not in html
