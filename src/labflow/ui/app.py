@@ -1,4 +1,4 @@
-"""LabFlow 知云版主界面。"""
+"""LabFlow 主界面。"""
 
 from __future__ import annotations
 
@@ -27,6 +27,11 @@ from labflow.ui.landing import (
 )
 from labflow.ui.paper_preview import LandingPaperPreview, build_landing_paper_preview
 from labflow.ui.pdf_viewer import render_pdf_viewer
+from labflow.ui.quick_guide import (
+    LandingQuickGuide,
+    LandingQuickGuideState,
+    build_landing_quick_guide,
+)
 from labflow.ui.repo_preview import LandingRepoPreview, build_landing_repo_preview
 from labflow.ui.sidebar import SidebarState, render_sidebar
 from labflow.ui.styles import inject_styles
@@ -36,6 +41,7 @@ REPORT_GENERATOR = ReportGenerator()
 ALIGNMENT_CACHE_VERSION = "learning-output-v23"
 __all__ = [
     "build_landing_paper_preview_state",
+    "build_landing_quick_guide_state",
     "build_landing_repo_preview_state",
     "build_landing_entry_header_html",
     "build_landing_hero_html",
@@ -64,7 +70,7 @@ class WorkspaceState:
 def run() -> None:
     settings = get_settings()
     st.set_page_config(
-        page_title="LabFlow 知云版",
+        page_title="LabFlow",
         page_icon="LF",
         layout="wide",
         initial_sidebar_state="collapsed",
@@ -82,6 +88,11 @@ def run() -> None:
         render_landing(
             paper_preview_resolver=build_landing_paper_preview_state,
             repo_preview_resolver=build_landing_repo_preview_state,
+            quick_guide_resolver=lambda pdf_bytes, source_name: build_landing_quick_guide_state(
+                pdf_bytes,
+                source_name,
+                settings,
+            ),
         )
 
 
@@ -90,6 +101,9 @@ def init_session_state() -> None:
     st.session_state.setdefault("landing_pdf_bytes", None)
     st.session_state.setdefault("landing_pdf_name", None)
     st.session_state.setdefault("landing_git_repo_path", "")
+    st.session_state.setdefault("landing_quick_guide_requested", False)
+    st.session_state.setdefault("landing_quick_guide_signature", None)
+    st.session_state.setdefault("landing_quick_guide_state", None)
     st.session_state.setdefault("workspace_signature", None)
     st.session_state.setdefault("workspace_data", None)
     st.session_state.setdefault("selected_section_index", None)
@@ -137,6 +151,25 @@ def build_landing_paper_preview_state(
     if preview is None:
         return LandingPaperPreviewState(hint="已上传论文，暂时还没识别出稳定的标题信息。")
     return LandingPaperPreviewState(preview=preview)
+
+
+def build_landing_quick_guide_state(
+    pdf_bytes: bytes | None,
+    source_name: str | None,
+    settings: Settings,
+) -> LandingQuickGuideState:
+    """首页快速导读优先返回可读结论，没有论文时只提示下一步。"""
+
+    if not pdf_bytes or not source_name:
+        return LandingQuickGuideState(hint="先上传论文，再生成快速导读。")
+
+    try:
+        guide = load_landing_quick_guide(pdf_bytes, source_name, settings)
+    except (RuntimeError, ValueError):
+        return LandingQuickGuideState(hint="当前论文暂时无法生成导读，可先进入工作区继续阅读。")
+    if guide is None:
+        return LandingQuickGuideState(hint="当前论文还没有提取到足够稳定的导读信息。")
+    return LandingQuickGuideState(guide=guide)
 
 
 @st.cache_resource(show_spinner=False)
@@ -338,6 +371,26 @@ def load_landing_paper_preview(
         source_name=source_name,
         semantic_paper=semantic_paper,
     )
+
+
+@st.cache_data(show_spinner=False)
+def load_landing_quick_guide(
+    pdf_bytes: bytes,
+    source_name: str,
+    settings: Settings,
+) -> LandingQuickGuide | None:
+    preview = load_landing_paper_preview(pdf_bytes, source_name)
+    if preview is None:
+        return None
+
+    llm_client = None
+    if settings.has_llm_credentials:
+        try:
+            llm_client = get_llm_client(settings)
+        except RuntimeError:
+            llm_client = None
+
+    return build_landing_quick_guide(preview, llm_client=llm_client)
 
 
 @st.cache_data(show_spinner=False)

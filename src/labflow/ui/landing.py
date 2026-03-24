@@ -9,6 +9,7 @@ from html import escape
 import streamlit as st
 
 from labflow.ui.paper_preview import LandingPaperPreview, build_paper_preview_html
+from labflow.ui.quick_guide import LandingQuickGuideState, build_quick_guide_html
 from labflow.ui.repo_preview import LandingRepoPreview, build_repo_preview_html
 
 
@@ -33,6 +34,8 @@ def render_landing(
     paper_preview_resolver: Callable[[bytes | None, str | None], LandingPaperPreviewState]
     | None = None,
     repo_preview_resolver: Callable[[str], LandingRepoPreviewState] | None = None,
+    quick_guide_resolver: Callable[[bytes | None, str | None], LandingQuickGuideState]
+    | None = None,
 ) -> None:
     has_pdf = bool(st.session_state.get("landing_pdf_bytes"))
     has_repo_path = bool(st.session_state.get("landing_git_repo_path", "").strip())
@@ -60,6 +63,7 @@ def render_landing(
             st.session_state["landing_pdf_name"] = uploaded_pdf.name
         st.session_state["landing_git_repo_path"] = git_repo_path
 
+        _render_quick_guide_card(quick_guide_resolver=quick_guide_resolver)
         _render_landing_action(has_pdf=has_pdf, has_repo_path=has_repo_path)
 
 
@@ -179,13 +183,79 @@ def _render_landing_action(*, has_pdf: bool, has_repo_path: bool) -> None:
             st.rerun()
 
 
+def _render_quick_guide_card(
+    *,
+    quick_guide_resolver: Callable[[bytes | None, str | None], LandingQuickGuideState] | None,
+) -> None:
+    current_pdf_bytes = st.session_state.get("landing_pdf_bytes")
+    current_pdf_name = st.session_state.get("landing_pdf_name")
+    current_signature = _build_pdf_signature(current_pdf_bytes, current_pdf_name)
+    previous_signature = st.session_state.get("landing_quick_guide_signature")
+    if current_signature != previous_signature:
+        st.session_state["landing_quick_guide_signature"] = current_signature
+        st.session_state["landing_quick_guide_state"] = None
+        st.session_state["landing_quick_guide_requested"] = False
+
+    with st.container(border=True):
+        st.markdown(
+            (
+                '<div class="quick-guide-head">'
+                '<div class="quick-guide-headline-text">快速导读</div>'
+                '<div class="quick-guide-head-desc">'
+                "先用一屏内容抓住论文问题、方法和阅读重点。"
+                "</div>"
+                "</div>"
+            ),
+            unsafe_allow_html=True,
+        )
+        if not current_pdf_bytes or not current_pdf_name:
+            st.caption("先上传论文，再生成导读。")
+            return
+
+        action_label = (
+            "更新导读"
+            if st.session_state.get("landing_quick_guide_state") is not None
+            else "生成快速导读"
+        )
+        if st.button(action_label, key="landing_quick_guide_button", use_container_width=False):
+            st.session_state["landing_quick_guide_requested"] = True
+            st.session_state["landing_quick_guide_state"] = None
+
+        if not st.session_state.get("landing_quick_guide_requested"):
+            st.caption("这里会把当前论文先讲明白，再决定要不要进入工作区继续细读。")
+            return
+
+        quick_guide_state = st.session_state.get("landing_quick_guide_state")
+        if quick_guide_state is None:
+            with st.spinner("正在生成快速导读..."):
+                quick_guide_state = (
+                    quick_guide_resolver(current_pdf_bytes, current_pdf_name)
+                    if quick_guide_resolver is not None
+                    else LandingQuickGuideState(hint="当前没有可用的导读生成器。")
+                )
+            st.session_state["landing_quick_guide_state"] = quick_guide_state
+
+        if quick_guide_state.guide is not None:
+            st.markdown(
+                build_quick_guide_html(quick_guide_state.guide),
+                unsafe_allow_html=True,
+            )
+        elif quick_guide_state.hint:
+            st.caption(quick_guide_state.hint)
+
+
+def _build_pdf_signature(pdf_bytes: bytes | None, pdf_name: str | None) -> str:
+    size = len(pdf_bytes) if pdf_bytes is not None else 0
+    return f"{pdf_name or 'none'}::{size}"
+
+
 def build_landing_hero_html(*, has_pdf: bool, has_repo_path: bool) -> str:
     state_text = build_landing_readiness_text(has_pdf=has_pdf, has_repo_path=has_repo_path)
     return (
         '<div class="landing-shell">'
         '<div class="landing-kicker">LabFlow</div>'
-        '<div class="landing-title">论文与代码，对齐阅读</div>'
-        '<div class="landing-body">准备好 PDF 和代码目录后，直接进入工作区。</div>'
+        '<div class="landing-title">一体化科研助手</div>'
+        '<div class="landing-body">上传论文、连接代码，然后直接开始阅读与定位。</div>'
         f'<div class="landing-status-line">{escape(state_text)}</div>'
         "</div>"
     )

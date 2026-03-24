@@ -9,6 +9,7 @@ from labflow.ui.app import (
     build_landing_entry_header_html,
     build_landing_hero_html,
     build_landing_paper_preview_state,
+    build_landing_quick_guide_state,
     build_landing_readiness_text,
     build_landing_repo_preview_state,
     build_reading_note_project_overview,
@@ -21,6 +22,7 @@ from labflow.ui.app import (
     resolve_runtime_settings,
     should_render_source_grounding,
 )
+from labflow.ui.paper_preview import LandingPaperPreview
 from labflow.ui.repo_preview import build_landing_repo_preview, build_repo_preview_html
 from labflow.ui.sidebar import SidebarState, _build_api_key_status
 
@@ -273,8 +275,8 @@ def test_build_landing_hero_html_reflects_progress_state() -> None:
 
     html = build_landing_hero_html(has_pdf=True, has_repo_path=False)
 
-    assert "论文与代码，对齐阅读" in html
-    assert "准备好 PDF 和代码目录后，直接进入工作区。" in html
+    assert "一体化科研助手" in html
+    assert "上传论文、连接代码，然后直接开始阅读与定位。" in html
     assert "还差代码目录。" in html
 
 
@@ -344,6 +346,34 @@ def test_build_landing_paper_preview_state_handles_parser_failure(monkeypatch) -
 
     assert state.preview is None
     assert state.hint == "论文已上传，进入工作区后仍可继续阅读。"
+
+
+def test_build_landing_quick_guide_state_returns_generated_guide(monkeypatch) -> None:
+    """首页快速导读在论文可解析时应返回导读卡片。"""
+
+    preview = LandingPaperPreview(
+        title="Think Global, Act Local",
+        authors=("Author A",),
+        abstract="A dual-scale graph transformer is introduced for navigation.",
+        source_label="已识别论文 · Think.pdf",
+        meta_items=("15 页",),
+        external_url=None,
+    )
+
+    monkeypatch.setattr(
+        app_module,
+        "load_landing_quick_guide",
+        lambda *_args: app_module.build_landing_quick_guide(preview),
+    )
+
+    state = build_landing_quick_guide_state(
+        b"%PDF-1.4",
+        "demo.pdf",
+        Settings(app_env="dev"),
+    )
+
+    assert state.guide is not None
+    assert "先用一屏内容抓住问题" in state.guide.headline
 
 
 def test_get_selected_section_supports_initial_silent_state() -> None:

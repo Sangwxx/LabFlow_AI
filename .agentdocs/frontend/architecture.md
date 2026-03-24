@@ -10,6 +10,7 @@
 - `ui/landing.py` 负责首页入口区块。
 - `ui/sidebar.py` 负责运行时配置与工作区侧边栏。
 - `ui/pdf_viewer.py` 负责 PDF 预览与热区联动。
+- `ui/quick_guide.py` 负责首页“快速导读”卡片的数据生成与 HTML 拼装。
 - `ui/styles.py` 统一注入全局样式。
 
 ## 开发约束
