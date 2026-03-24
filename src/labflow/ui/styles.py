@@ -49,6 +49,10 @@ APP_STYLES = """
     .quick-guide-item { padding: 0.82rem 0.9rem; border-radius: 14px; background: rgba(255, 255, 255, 0.72); border: 1px solid rgba(189, 174, 153, 0.24); }
     .quick-guide-label { color: #7f6a52; font-size: 0.8rem; font-weight: 700; margin-bottom: 0.38rem; }
     .quick-guide-body { color: #465a6d; font-size: 0.9rem; line-height: 1.72; }
+    .guide-page-shell { max-width: 42rem; margin: 2.8rem auto 1.4rem auto; text-align: center; }
+    .guide-page-kicker { font-size: 0.82rem; letter-spacing: 0.16em; text-transform: uppercase; color: #8b755d; margin-bottom: 0.85rem; }
+    .guide-page-title { font-size: 2.35rem; line-height: 1.1; font-weight: 700; color: #182a3b; margin-bottom: 0.8rem; }
+    .guide-page-body { max-width: 30rem; margin: 0 auto; font-size: 0.95rem; line-height: 1.7; color: #55697a; }
     .repo-preview-head { margin-bottom: 0.75rem; }
     .repo-preview-title { color: #1b3042; font-size: 0.92rem; font-weight: 700; margin-bottom: 0.2rem; }
     .repo-preview-desc { color: #667889; font-size: 0.84rem; line-height: 1.6; }
@@ -65,7 +69,7 @@ APP_STYLES = """
     div[data-testid="column"] [data-testid="stTextInputRootElement"] input { min-height: 3.1rem; border-radius: 14px; border: 1px solid rgba(189, 174, 153, 0.5); background: #fcfaf6; }
     div[data-testid="column"] [data-testid="stFileUploader"], div[data-testid="column"] [data-testid="stTextInput"] { padding: 0.25rem 0 0.05rem 0; border-radius: 0; background: transparent; border: 0; box-shadow: none; }
     div[data-testid="column"] [data-testid="stFileUploader"] small, div[data-testid="column"] [data-testid="stTextInput"] small { color: #7f7264; }
-    @media (max-width: 900px) { .landing-shell { margin-top: 2.2rem; } .landing-title { font-size: 2rem; } .quick-guide-grid { grid-template-columns: 1fr; } }
+    @media (max-width: 900px) { .landing-shell { margin-top: 2.2rem; } .landing-title { font-size: 2rem; } .quick-guide-grid { grid-template-columns: 1fr; } .guide-page-title { font-size: 1.88rem; } }
     div[data-testid="stButton"] > button { min-height: 3.05rem; border-radius: 14px; border: 0; background: linear-gradient(180deg, #20344a 0%, #162638 100%); color: #f7f2ea; font-weight: 700; box-shadow: 0 14px 24px rgba(22, 38, 56, 0.16); }
     div[data-testid="stButton"] > button:hover { background: linear-gradient(180deg, #263d56 0%, #1b2d42 100%); color: #fffaf2; }
     .workspace-title { font-size: 2.4rem; font-weight: 700; color: #1a2b3d; }

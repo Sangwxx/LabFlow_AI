@@ -46,6 +46,9 @@
 - `.agentdocs/workflow/260322-modular-agent-orchestration.md`
   - 读取场景：继续把推理层拆成 Planner + 多子 Agent，并恢复代码对齐链可见性时必读。
   - 主要内容：模块化子 Agent 方案、Planner 决策字段、源码展示阈值调整与测试范围。
+- `.agentdocs/workflow/260324-quick-guide-page.md`
+  - 读取场景：把首页“快速导读”从内联卡片改为独立页面入口时必读。
+  - 主要内容：导读页独立化目标、路由改造范围、首页入口收敛方式与验证要求。
 
 ## 仓库外层输入资料
 

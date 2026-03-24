@@ -17,6 +17,7 @@ from labflow.reasoning.agent_executor import PlanAndExecuteAgent
 from labflow.reasoning.evidence_builder import EvidenceBuilder
 from labflow.reasoning.models import AlignmentResult, CodeEvidence, PaperSection
 from labflow.reporting import ReadingNoteEntry, ReportGenerator
+from labflow.ui.guide_page import render_quick_guide_page
 from labflow.ui.landing import (
     LandingPaperPreviewState,
     LandingRepoPreviewState,
@@ -84,15 +85,12 @@ def run() -> None:
 
     if current_route == "workspace":
         render_workspace(runtime_settings)
+    elif current_route == "quick_guide":
+        render_quick_guide(runtime_settings)
     else:
         render_landing(
             paper_preview_resolver=build_landing_paper_preview_state,
             repo_preview_resolver=build_landing_repo_preview_state,
-            quick_guide_resolver=lambda pdf_bytes, source_name: build_landing_quick_guide_state(
-                pdf_bytes,
-                source_name,
-                settings,
-            ),
         )
 
 
@@ -101,9 +99,6 @@ def init_session_state() -> None:
     st.session_state.setdefault("landing_pdf_bytes", None)
     st.session_state.setdefault("landing_pdf_name", None)
     st.session_state.setdefault("landing_git_repo_path", "")
-    st.session_state.setdefault("landing_quick_guide_requested", False)
-    st.session_state.setdefault("landing_quick_guide_signature", None)
-    st.session_state.setdefault("landing_quick_guide_state", None)
     st.session_state.setdefault("workspace_signature", None)
     st.session_state.setdefault("workspace_data", None)
     st.session_state.setdefault("selected_section_index", None)
@@ -212,6 +207,26 @@ def render_workspace(runtime_settings: Settings) -> None:
         selected_section = render_pdf_panel(workspace)
     with right_column:
         render_code_panel(workspace, selected_section, runtime_settings)
+
+
+def render_quick_guide(runtime_settings: Settings) -> None:
+    """渲染独立的论文导读页。"""
+
+    pdf_bytes, pdf_name = resolve_pdf_source()
+    preview = None
+    guide = None
+    if pdf_bytes and pdf_name:
+        preview_state = build_landing_paper_preview_state(pdf_bytes, pdf_name)
+        guide_state = build_landing_quick_guide_state(pdf_bytes, pdf_name, runtime_settings)
+        preview = preview_state.preview
+        guide = guide_state.guide
+
+    render_quick_guide_page(
+        preview=preview,
+        guide=guide,
+        source_name=pdf_name,
+        has_repo_path=bool(resolve_git_repo_path()),
+    )
 
 
 def resolve_runtime_settings(base_settings: Settings, sidebar_state: SidebarState) -> Settings:

@@ -7,6 +7,7 @@
 ## 当前架构
 
 - `ui/app.py` 负责页面编排、工作区主流程与对外导出。
+- `ui/guide_page.py` 负责独立论文导读页的渲染与页面动作。
 - `ui/landing.py` 负责首页入口区块。
 - `ui/sidebar.py` 负责运行时配置与工作区侧边栏。
 - `ui/pdf_viewer.py` 负责 PDF 预览与热区联动。
