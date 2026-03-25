@@ -42,12 +42,12 @@ APP_STYLES = """
     .quick-guide-head { margin: 0.15rem 0 0.9rem 0; }
     .quick-guide-headline-text { color: #1b3042; font-size: 1.18rem; font-weight: 700; margin-bottom: 0.25rem; }
     .quick-guide-head-desc { color: #5d6f7f; font-size: 0.92rem; line-height: 1.65; }
-    .quick-guide-shell { margin-top: 0.15rem; padding: 0.15rem 0; }
-    .quick-guide-headline { color: #1b3042; font-size: 1.06rem; line-height: 1.6; font-weight: 700; margin-bottom: 0.75rem; }
-    .quick-guide-stack { display: grid; gap: 0.7rem; }
-    .quick-guide-item { padding: 0.88rem 0.95rem; border-radius: 14px; background: rgba(255, 255, 255, 0.72); border: 1px solid rgba(189, 174, 153, 0.24); }
-    .quick-guide-label { color: #7f6a52; font-size: 0.8rem; font-weight: 700; margin-bottom: 0.38rem; }
-    .quick-guide-body { color: #465a6d; font-size: 0.9rem; line-height: 1.72; }
+    .guide-report-shell { margin-top: 0.15rem; padding: 0.15rem 0; }
+    .guide-report-headline { color: #1b3042; font-size: 1.08rem; line-height: 1.7; font-weight: 700; margin-bottom: 0.95rem; padding-bottom: 0.7rem; border-bottom: 1px solid rgba(189, 174, 153, 0.3); }
+    .guide-report-stack { display: grid; gap: 0.82rem; }
+    .guide-report-item { padding: 0.05rem 0; }
+    .guide-report-label { color: #8b4c3f; font-size: 0.9rem; font-weight: 800; margin-bottom: 0.2rem; }
+    .guide-report-body { color: #465a6d; font-size: 0.96rem; line-height: 1.82; }
     .guide-page-shell { margin: 0.45rem 0 0.15rem 0; text-align: left; }
     .guide-page-kicker { font-size: 0.78rem; letter-spacing: 0.14em; text-transform: uppercase; color: #8b755d; margin-bottom: 0.2rem; }
     .guide-page-title { font-size: 1.9rem; line-height: 1.12; font-weight: 700; color: #182a3b; margin-bottom: 0.25rem; }

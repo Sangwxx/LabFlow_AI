@@ -44,15 +44,8 @@ def render_quick_guide_page(
         st.markdown(build_guide_page_overview_html(preview), unsafe_allow_html=True)
 
     with st.container(border=True):
-        st.markdown("### 导读结论")
+        st.markdown("### 导读报告")
         st.markdown(build_quick_guide_html(normalized_guide), unsafe_allow_html=True)
-
-    with st.container(border=True):
-        st.markdown("### 摘要导读")
-        if normalized_guide.abstract_digest:
-            st.markdown(normalized_guide.abstract_digest)
-        else:
-            st.info("当前还没有生成摘要导读。")
 
 
 def build_quick_guide_page_header_html(*, source_name: str | None) -> str:
@@ -69,7 +62,7 @@ def build_quick_guide_page_header_html(*, source_name: str | None) -> str:
 
 
 def _render_quick_guide_page_header(*, source_name: str | None, has_repo_path: bool) -> None:
-    header_column, home_column, workspace_column = st.columns([6.4, 1.2, 1.4], gap="small")
+    header_column, home_column, workspace_column = st.columns([7.2, 1.55, 1.85], gap="small")
     with header_column:
         st.markdown(
             build_quick_guide_page_header_html(source_name=source_name),
@@ -79,13 +72,14 @@ def _render_quick_guide_page_header(*, source_name: str | None, has_repo_path: b
             st.caption("当前还没有填写代码路径，这一页先聚焦论文理解。")
     with home_column:
         st.write("")
-        if st.button("首页", key="quick-guide-back-home"):
+        if st.button("返回首页", use_container_width=True, key="quick-guide-back-home"):
             st.session_state["current_route"] = "landing"
             st.rerun()
     with workspace_column:
         st.write("")
         if st.button(
-            "工作区",
+            "进入工作区",
+            use_container_width=True,
             disabled=not has_repo_path,
             key="quick-guide-to-workspace",
         ):

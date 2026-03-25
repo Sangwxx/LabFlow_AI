@@ -76,12 +76,17 @@ class QuickGuideFacts:
 
 @dataclass(frozen=True)
 class LandingQuickGuide:
-    """首页快速导读卡片的数据。"""
+    """导读页阅读报告数据。"""
 
     headline: str
-    problem: str
-    method: str
-    focus: str
+    core_question: str
+    core_conclusion: str
+    contribution: str
+    intro_path: str
+    data_method: str
+    analysis_flow: str
+    takeaway: str
+    limitation: str
     abstract_digest: str
 
 
@@ -105,7 +110,7 @@ def build_landing_quick_guide(
             system_prompt=_build_quick_guide_system_prompt(),
             user_prompt=_build_quick_guide_user_prompt(preview),
             temperature=0.1,
-            max_tokens=900,
+            max_tokens=2200,
         )
         guide = _parse_quick_guide_payload(payload)
         if guide is not None:
@@ -117,19 +122,27 @@ def build_landing_quick_guide(
 def coerce_landing_quick_guide(guide: object, preview: LandingPaperPreview) -> LandingQuickGuide:
     """把历史缓存或非中文结果兜底成当前版本可用的中文导读。"""
 
-    if isinstance(guide, LandingQuickGuide):
-        candidate = guide
-    else:
-        candidate = LandingQuickGuide(
-            headline=_clean_quick_guide_text(getattr(guide, "headline", "")),
-            problem=_clean_quick_guide_text(getattr(guide, "problem", "")),
-            method=_clean_quick_guide_text(getattr(guide, "method", "")),
-            focus=_clean_quick_guide_text(getattr(guide, "focus", "")),
-            abstract_digest=_clean_quick_guide_text(
-                getattr(guide, "abstract_digest", ""),
-                max_length=220,
-            ),
-        )
+    candidate = LandingQuickGuide(
+        headline=_clean_quick_guide_text(getattr(guide, "headline", "")),
+        core_question=_clean_quick_guide_text(
+            getattr(guide, "core_question", getattr(guide, "problem", ""))
+        ),
+        core_conclusion=_clean_quick_guide_text(
+            getattr(guide, "core_conclusion", getattr(guide, "focus", ""))
+        ),
+        contribution=_clean_quick_guide_text(getattr(guide, "contribution", "")),
+        intro_path=_clean_quick_guide_text(getattr(guide, "intro_path", "")),
+        data_method=_clean_quick_guide_text(
+            getattr(guide, "data_method", getattr(guide, "method", ""))
+        ),
+        analysis_flow=_clean_quick_guide_text(getattr(guide, "analysis_flow", "")),
+        takeaway=_clean_quick_guide_text(getattr(guide, "takeaway", "")),
+        limitation=_clean_quick_guide_text(getattr(guide, "limitation", "")),
+        abstract_digest=_clean_quick_guide_text(
+            getattr(guide, "abstract_digest", ""),
+            max_length=520,
+        ),
+    )
 
     if _needs_chinese_fallback(candidate):
         return _build_fallback_quick_guide(preview)
@@ -137,15 +150,25 @@ def coerce_landing_quick_guide(guide: object, preview: LandingPaperPreview) -> L
 
 
 def build_quick_guide_html(guide: LandingQuickGuide) -> str:
-    """把快速导读渲染为卡片 HTML。"""
+    """把导读报告渲染为单卡片 HTML。"""
 
+    sections = (
+        ("核心研究问题", guide.core_question),
+        ("核心结论", guide.core_conclusion),
+        ("本文贡献", guide.contribution),
+        ("Introduction 怎么展开", guide.intro_path),
+        ("方法与实验", guide.data_method),
+        ("分析怎么组织", guide.analysis_flow),
+        ("我能学到什么", guide.takeaway),
+        ("还可以怎么往下挖", guide.limitation),
+        ("摘要导读", guide.abstract_digest),
+    )
+    sections_html = "".join(_build_quick_guide_item(label, body) for label, body in sections)
     return (
-        '<div class="quick-guide-shell">'
-        f'<div class="quick-guide-headline">{escape(guide.headline)}</div>'
-        '<div class="quick-guide-stack">'
-        f"{_build_quick_guide_item('这篇论文要解决什么', guide.problem)}"
-        f"{_build_quick_guide_item('方法核心', guide.method)}"
-        f"{_build_quick_guide_item('阅读时先关注什么', guide.focus)}"
+        '<div class="guide-report-shell">'
+        f'<div class="guide-report-headline">{escape(guide.headline)}</div>'
+        '<div class="guide-report-stack">'
+        f"{sections_html}"
         "</div>"
         "</div>"
     )
@@ -153,9 +176,9 @@ def build_quick_guide_html(guide: LandingQuickGuide) -> str:
 
 def _build_quick_guide_item(label: str, body: str) -> str:
     return (
-        '<div class="quick-guide-item">'
-        f'<div class="quick-guide-label">{escape(label)}</div>'
-        f'<div class="quick-guide-body">{escape(body)}</div>'
+        '<div class="guide-report-item">'
+        f'<div class="guide-report-label">{escape(label)}</div>'
+        f'<div class="guide-report-body">{escape(body)}</div>'
         "</div>"
     )
 
@@ -170,17 +193,26 @@ def _build_quick_guide_system_prompt() -> str:
 2. 不要照搬英文摘要原句，要写成中文导读。
 3. 不要空话，不要营销口吻，不要夸大结论。
 4. 语气像人类开发者或实验室同学在介绍这篇论文该怎么读。
-5. 每个字段控制在 1-2 句，简洁、具体、可读。
+5. 每个字段控制在 2-4 句，简洁、具体、可读，不要只写一句概括。
 6. 只返回 JSON 对象，不要输出额外解释。
-7. problem、method、focus、abstract_digest 必须落到论文的任务、方法模块、
-   实验对象或结果上，不能写泛化套话。
+7. 所有字段都必须落到论文的任务、方法模块、实验对象或结果上，不能写泛化套话。
 8. 不要出现“从现有信息看”“建议优先关注输入输出关系”“当前还没有拿到稳定结果”这类空洞表达。
+9. 每个字段尽量遵守这个结构：
+   - 第一句直接回答标题问题；
+   - 第二句解释为什么、怎么做或靠什么支撑；
+   - 如有必要，第三句补充阅读重点、实验验证或局限。
+10. 不要写成提纲词组，不要只写一句话。
 
 字段：
 - headline: 一句话概括这篇论文值得怎么读
-- problem: 这篇论文主要在解决什么问题
-- method: 它的方法核心是什么
-- focus: 第一次阅读时最值得先关注什么
+- core_question: 这篇论文的核心研究问题是什么
+- core_conclusion: 这篇论文最后得出的核心结论是什么
+- contribution: 这篇论文相对已有工作新增了哪些关键贡献
+- intro_path: 这篇论文的 introduction 大致是怎么铺垫问题并引出方法的
+- data_method: 论文用了什么方法、什么实验对象或评测设置，为什么这些东西重要
+- analysis_flow: 实验和分析部分是怎么组织起来支撑结论的
+- takeaway: 站在科研训练角度，这篇论文最值得学习的地方是什么
+- limitation: 这篇论文目前还可能有哪些不足，后续还可以往哪里继续做
 - abstract_digest: 用中文概括摘要的主要信息，适合放在“摘要导读”区域
 """.strip()
 
@@ -196,18 +228,41 @@ def _parse_quick_guide_payload(payload: dict | None) -> LandingQuickGuide | None
         return None
 
     headline = _clean_quick_guide_text(payload.get("headline"))
-    problem = _clean_quick_guide_text(payload.get("problem"))
-    method = _clean_quick_guide_text(payload.get("method"))
-    focus = _clean_quick_guide_text(payload.get("focus"))
-    abstract_digest = _clean_quick_guide_text(payload.get("abstract_digest"), max_length=220)
-    if not all((headline, problem, method, focus, abstract_digest)):
+    core_question = _clean_quick_guide_text(payload.get("core_question"))
+    core_conclusion = _clean_quick_guide_text(payload.get("core_conclusion"))
+    contribution = _clean_quick_guide_text(payload.get("contribution"))
+    intro_path = _clean_quick_guide_text(payload.get("intro_path"))
+    data_method = _clean_quick_guide_text(payload.get("data_method"))
+    analysis_flow = _clean_quick_guide_text(payload.get("analysis_flow"))
+    takeaway = _clean_quick_guide_text(payload.get("takeaway"))
+    limitation = _clean_quick_guide_text(payload.get("limitation"))
+    abstract_digest = _clean_quick_guide_text(payload.get("abstract_digest"), max_length=520)
+    if not all(
+        (
+            headline,
+            core_question,
+            core_conclusion,
+            contribution,
+            intro_path,
+            data_method,
+            analysis_flow,
+            takeaway,
+            limitation,
+            abstract_digest,
+        )
+    ):
         return None
 
     return LandingQuickGuide(
         headline=headline,
-        problem=problem,
-        method=method,
-        focus=focus,
+        core_question=core_question,
+        core_conclusion=core_conclusion,
+        contribution=contribution,
+        intro_path=intro_path,
+        data_method=data_method,
+        analysis_flow=analysis_flow,
+        takeaway=takeaway,
+        limitation=limitation,
         abstract_digest=abstract_digest,
     )
 
@@ -223,22 +278,64 @@ def _build_fallback_quick_guide(preview: LandingPaperPreview) -> LandingQuickGui
         if facts.benchmark_names
         else "实验上重点看指标是否真的覆盖了它宣称解决的问题。"
     )
+    benchmark_names = (
+        "、".join(facts.benchmark_names[:3]) if facts.benchmark_names else "主要评测基准"
+    )
+    challenge_summary = "、".join(facts.challenge_points[:2])
+    method_summary = "、".join(facts.method_points[:3]) if facts.method_points else "核心方法"
+    result_summary = "；".join(facts.result_points[:2])
     return LandingQuickGuide(
-        headline=f"先抓 {facts.task} 的任务目标，再看 {method_summary} 是怎么配合起来完成决策的。",
-        problem=(
-            f"这篇论文聚焦 {facts.task}{challenge_summary}。"
-            "如果先不把任务输入、环境约束和评测目标看清，后面的方法部分会很容易读散。"
+        headline=(
+            f"先抓 {facts.task} 的问题边界，"
+            f"再顺着 {method_summary} 去看它如何把整条研究链路搭起来。"
         ),
-        method=(
-            f"方法主线可以先概括成：{method_summary}。"
-            "阅读时优先找清每个模块分别负责感知、建模还是决策，再看它们之间如何传递信息。"
+        core_question=(
+            f"这篇论文聚焦 {facts.task}，核心想解决的是 {challenge_summary}。"
+            "它面对的不是单一步骤分类问题，而是语言理解、视觉感知和行动决策必须连续配合的任务。"
+            "如果不先把任务输入、环境约束和评测目标看清，后面的模型设计会很容易读散。"
         ),
-        focus=(f"第一次阅读建议先看任务设定和方法总览，再顺着核心模块往下读；{benchmark_summary}"),
+        core_conclusion=(
+            f"作者的核心结论是：通过 {method_summary}，"
+            f"可以把理解、建图和决策更稳地串起来；{result_summary}。"
+            "换句话说，这篇论文想证明的不是某个单点模块更强，而是整条研究链路被重新组织后会更有效。"
+        ),
+        contribution=(
+            f"相对已有工作，这篇论文的主要贡献在于把 {facts.task} 拆成更清楚的子问题，"
+            f"并用 {method_summary} 去分别覆盖这些环节。"
+            "这种贡献方式的好处是，读者能够明确看到每个模块到底在补哪个旧方法短板，而不是只看到一个总名字。"
+        ),
+        intro_path=(
+            "Introduction 可以按“任务背景 -> 现有方法不足 -> "
+            "本文方法切入点 -> 实验验证”这条顺序去读。"
+            f"读的时候重点看作者是怎么把 {challenge_summary} 引到自己方法上的。"
+            "如果这一段铺垫读顺了，后面的模型结构图和实验表格会更容易对上。"
+        ),
+        data_method=(
+            f"方法部分先抓 {method_summary} 这些模块分别负责什么；"
+            f"实验部分再看 {benchmark_names} 这些基准为什么能验证它的主张。"
+            "阅读时不要只记模块名称，还要顺手判断这些模块是不是确实对应了论文前面提出的任务难点。"
+        ),
+        analysis_flow=(
+            "实验阅读建议按“主结果 -> 关键模块是否真的有效 -> "
+            f"指标和成功率是否同步改善”这条线走；{benchmark_summary}"
+            "这样读可以避免只盯着单个最优数字，而忽略整套论证是否真的闭环。"
+        ),
+        takeaway=(
+            f"这篇论文最值得学的是：它没有把 {facts.task} 当成单一步骤，"
+            "而是先拆问题，再让方法设计一一对应这些难点。"
+            "如果你以后自己写论文，这种“问题拆解 -> 模块对应 -> 实验证明”的组织方式，"
+            "比单纯记模型名更有参考价值。"
+        ),
+        limitation=(
+            "从摘要层面看，当前还无法判断方法代价、泛化边界和失败案例覆盖得够不够。"
+            "后续可以重点追踪消融实验、错误案例和更复杂场景下的稳定性。"
+            "如果正文没有把这些地方补齐，那这篇论文的说服力其实还是有上限的。"
+        ),
         abstract_digest=_build_fallback_abstract_digest(facts),
     )
 
 
-def _clean_quick_guide_text(value: object, max_length: int = 140) -> str:
+def _clean_quick_guide_text(value: object, max_length: int = 420) -> str:
     if not isinstance(value, str):
         return ""
     normalized = " ".join(value.split()).strip("：:;；，,。 ")
@@ -250,9 +347,14 @@ def _clean_quick_guide_text(value: object, max_length: int = 140) -> str:
 def _needs_chinese_fallback(guide: LandingQuickGuide) -> bool:
     texts = (
         guide.headline,
-        guide.problem,
-        guide.method,
-        guide.focus,
+        guide.core_question,
+        guide.core_conclusion,
+        guide.contribution,
+        guide.intro_path,
+        guide.data_method,
+        guide.analysis_flow,
+        guide.takeaway,
+        guide.limitation,
         guide.abstract_digest,
     )
     if not all(texts):
@@ -355,4 +457,5 @@ def _build_fallback_abstract_digest(facts: QuickGuideFacts) -> str:
         f"这篇论文面向 {facts.task}，核心难点在于 {challenge_summary}。"
         f"作者给出的主方法是 {method_summary}，试图把理解、建图和决策这几步串成一条完整链路。"
         f"{result_summary}。"
+        "如果把摘要当成整篇论文的缩影来看，它真正想强调的是：这不是单一模块优化，而是整条方法链路的协同设计。"
     )
