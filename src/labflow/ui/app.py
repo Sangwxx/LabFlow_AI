@@ -228,6 +228,7 @@ def render_quick_guide(runtime_settings: Settings) -> None:
         guide=guide,
         source_name=pdf_name,
         has_repo_path=bool(resolve_git_repo_path()),
+        has_llm_credentials=runtime_settings.has_llm_credentials,
     )
 
 
@@ -436,6 +437,8 @@ def render_pdf_panel(workspace: WorkspaceState) -> PaperSection | None:
         st.error(workspace.pdf_error)
         if "PyMuPDF" in workspace.pdf_error:
             st.caption("请先执行 `python -m pip install pymupdf`，然后刷新页面。")
+        else:
+            st.caption("可以返回首页重新上传论文，或先检查 PDF 文件是否损坏。")
 
     sync_hotspot_selection(workspace)
     selected_section = get_selected_section(workspace.focus_sections)
@@ -535,6 +538,7 @@ def render_code_panel(
 ) -> None:
     if workspace.repo_error:
         st.error(workspace.repo_error)
+        st.caption("请确认代码路径真实存在，且当前目录下包含可解析的源码文件。")
         return
     if workspace.repo_result is None:
         st.info("先准备代码目录，右侧才会显示对应代码。")
@@ -542,16 +546,25 @@ def render_code_panel(
     if selected_section is None:
         st.info("请选择论文片段开始深度对齐。")
         return
+    if not runtime_settings.has_llm_credentials:
+        st.warning(
+            "当前未配置模型 API Key，本轮会优先使用本地兜底结果，中文讲解和代码解释会更保守。"
+        )
 
     trace_events: list[dict] = []
     trace_placeholder = st.empty()
+    runtime_feedback = st.empty()
 
     def handle_agent_event(event: dict) -> None:
         trace_events.append(event)
         render_trace_panel(trace_placeholder, trace_events, finalized=False)
+        message = build_alignment_runtime_message(event)
+        if message:
+            runtime_feedback.info(message)
 
     try:
-        with st.spinner("Agent 正在先思考、再拆解、后执行，请稍等..."):
+        runtime_feedback.info("正在解析当前论文片段，准备检索相关代码证据。")
+        with st.spinner("正在解析当前片段并生成对应讲解，请稍等..."):
             alignment_result = get_semantic_alignment(
                 workspace_signature=st.session_state.get("workspace_signature", ""),
                 selected_section=selected_section,
@@ -562,14 +575,17 @@ def render_code_panel(
             )
     except Exception as exc:  # noqa: BLE001
         trace_placeholder.empty()
+        runtime_feedback.empty()
         st.error(f"Agent 推理过程中出现异常：{exc}")
         st.info("本轮已停止推理。建议稍后重试，或先把注意力放回论文片段本身。")
         return
 
     trace_placeholder.empty()
     if alignment_result is None:
+        runtime_feedback.warning("这一轮没有拿到稳定结果，建议换一个更具体的论文片段再试。")
         st.warning("本轮模型没有稳定返回，我已停止展示中间推理链。")
         return
+    runtime_feedback.success("当前片段的讲解与代码结果已生成完成。")
     record_reading_note_entry(
         st.session_state.get("workspace_signature", ""),
         selected_section,
@@ -658,6 +674,30 @@ def render_trace_event(event: dict, status=None) -> None:
         writer(f"**[Current Plan]** {event.get('message', '')}")
 
 
+def build_alignment_runtime_message(event: dict) -> str:
+    """把内部事件转换成工作区顶部的运行状态文案。"""
+
+    kind = str(event.get("kind", "")).strip()
+    if kind == "cache_hit":
+        return "已命中缓存，正在复用上一轮稳定结果。"
+    if kind == "plan_update":
+        return "正在拆解当前片段，判断应该优先查看哪些证据。"
+    if kind == "current_plan":
+        return "正在整理当前执行计划。"
+    if kind == "thought":
+        return "正在补充机制解释并收束候选代码。"
+    if kind == "action":
+        action_name = str(event.get("message", "")).strip()
+        if action_name == "translate_section":
+            return "正在生成当前片段的中文讲解。"
+        if action_name == "code_grounding":
+            return "正在检索相关代码，并核对是否真的对应当前片段。"
+        return "正在执行当前步骤。"
+    if kind == "observation":
+        return str(event.get("message", "")).strip()
+    return ""
+
+
 def render_code_canvas(
     alignment_result: AlignmentResult,
     trace_events: list[dict],
@@ -736,6 +776,9 @@ def render_reading_note_tab(workspace: WorkspaceState, runtime_settings: Setting
         return
 
     st.caption(f"当前已记录 {len(entries)} 个已读片段与对应代码。")
+    if not runtime_settings.has_llm_credentials:
+        st.caption("当前未配置模型 API Key，阅读笔记会在本地兜底和已有结果之间尽量补全。")
+    note_generated = False
     if st.button("生成阅读笔记", use_container_width=True):
         note_signature = build_reading_note_markdown_signature(
             workspace_signature=st.session_state.get("workspace_signature", ""),
@@ -767,12 +810,15 @@ def render_reading_note_tab(workspace: WorkspaceState, runtime_settings: Setting
                     progress_bar.progress(90, text="正在整理最终 Markdown...")
                     status.update(label="阅读笔记生成完成", state="complete")
                     progress_bar.progress(100, text="阅读笔记已生成完成")
+                    note_generated = True
             finally:
                 status_placeholder.empty()
                 progress_bar.empty()
 
     markdown = st.session_state.get("reading_note_markdown", "").strip()
     if markdown:
+        if note_generated:
+            st.success("阅读笔记已生成完成，可直接下载或继续补充更多片段。")
         st.download_button(
             "下载 Markdown 笔记",
             data=markdown.encode("utf-8"),

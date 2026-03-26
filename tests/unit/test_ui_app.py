@@ -7,6 +7,7 @@ import labflow.ui.landing as landing_module
 from labflow.config.settings import Settings
 from labflow.reasoning.models import AlignmentResult, PaperSection, SourceGuideItem
 from labflow.ui.app import (
+    build_alignment_runtime_message,
     build_landing_entry_header_html,
     build_landing_hero_html,
     build_landing_paper_preview_state,
@@ -540,6 +541,23 @@ def test_build_reading_note_markdown_signature_tracks_alignment_changes() -> Non
     )
 
     assert signature_a != signature_b
+
+
+def test_build_alignment_runtime_message_maps_key_events() -> None:
+    """工作区顶部运行提示应把内部事件转换成可理解的状态文案。"""
+
+    assert (
+        build_alignment_runtime_message({"kind": "cache_hit", "message": "命中缓存"})
+        == "已命中缓存，正在复用上一轮稳定结果。"
+    )
+    assert (
+        build_alignment_runtime_message({"kind": "action", "message": "translate_section"})
+        == "正在生成当前片段的中文讲解。"
+    )
+    assert (
+        build_alignment_runtime_message({"kind": "action", "message": "code_grounding"})
+        == "正在检索相关代码，并核对是否真的对应当前片段。"
+    )
 
 
 def test_source_grounding_shows_for_viable_grounding_result() -> None:

@@ -2,6 +2,7 @@
 
 from labflow.ui.guide_page import (
     build_guide_page_overview_html,
+    build_guide_page_status_text,
     build_quick_guide_page_header_html,
 )
 from labflow.ui.paper_preview import LandingPaperPreview
@@ -38,3 +39,16 @@ def test_build_guide_page_overview_html_hides_raw_abstract() -> None:
     assert "Think Global, Act Local" in html
     assert "Author A" in html
     assert "A dual-scale graph transformer is introduced for navigation." not in html
+
+
+def test_build_guide_page_status_text_reflects_runtime_state() -> None:
+    """导读页顶部应明确说明当前能否直接进入工作区，以及是否启用模型。"""
+
+    assert (
+        build_guide_page_status_text(has_repo_path=True, has_llm_credentials=True)
+        == "代码目录已连接，可直接进入工作区继续定位源码实现。"
+    )
+    assert (
+        build_guide_page_status_text(has_repo_path=True, has_llm_credentials=False)
+        == "代码目录已连接；当前未配置模型 API Key，导读会优先使用本地兜底。"
+    )

@@ -42,16 +42,18 @@ APP_STYLES = """
     .quick-guide-head { margin: 0.15rem 0 0.9rem 0; }
     .quick-guide-headline-text { color: #1b3042; font-size: 1.18rem; font-weight: 700; margin-bottom: 0.25rem; }
     .quick-guide-head-desc { color: #5d6f7f; font-size: 0.92rem; line-height: 1.65; }
-    .guide-report-shell { margin-top: 0.15rem; padding: 0.15rem 0; }
-    .guide-report-headline { color: #1b3042; font-size: 1.08rem; line-height: 1.7; font-weight: 700; margin-bottom: 0.95rem; padding-bottom: 0.7rem; border-bottom: 1px solid rgba(189, 174, 153, 0.3); }
-    .guide-report-stack { display: grid; gap: 0.82rem; }
-    .guide-report-item { padding: 0.05rem 0; }
-    .guide-report-label { color: #8b4c3f; font-size: 0.9rem; font-weight: 800; margin-bottom: 0.2rem; }
-    .guide-report-body { color: #465a6d; font-size: 0.96rem; line-height: 1.82; }
-    .guide-page-shell { margin: 0.45rem 0 0.15rem 0; text-align: left; }
-    .guide-page-kicker { font-size: 0.78rem; letter-spacing: 0.14em; text-transform: uppercase; color: #8b755d; margin-bottom: 0.2rem; }
-    .guide-page-title { font-size: 1.9rem; line-height: 1.12; font-weight: 700; color: #182a3b; margin-bottom: 0.25rem; }
-    .guide-page-body { font-size: 0.95rem; line-height: 1.6; color: #55697a; }
+    .guide-report-shell { margin-top: 0.05rem; padding: 0; }
+    .guide-report-headline { color: #1b3042; font-size: 1.04rem; line-height: 1.75; font-weight: 700; margin-bottom: 0.82rem; padding-bottom: 0.58rem; border-bottom: 1px solid rgba(189, 174, 153, 0.28); }
+    .guide-report-stack { display: grid; gap: 0.72rem; }
+    .guide-report-item { padding: 0.02rem 0; }
+    .guide-report-label { color: #8b4c3f; font-size: 0.88rem; font-weight: 800; margin-bottom: 0.16rem; }
+    .guide-report-body { color: #465a6d; font-size: 0.95rem; line-height: 1.78; }
+    .guide-page-shell { margin: 0.12rem 0 0.1rem 0; text-align: left; }
+    .guide-page-kicker { font-size: 0.76rem; letter-spacing: 0.14em; text-transform: uppercase; color: #8b755d; margin-bottom: 0.16rem; }
+    .guide-page-title { font-size: 1.72rem; line-height: 1.08; font-weight: 700; color: #182a3b; margin-bottom: 0.18rem; }
+    .guide-page-body { font-size: 0.92rem; line-height: 1.55; color: #55697a; }
+    .guide-page-toolbar-note { min-height: 2.9rem; padding: 0.7rem 0.9rem; margin-top: 0.18rem; margin-bottom: 0.55rem; border-radius: 14px; background: rgba(248, 250, 252, 0.92); border: 1px solid rgba(31, 43, 61, 0.08); color: #53677a; font-size: 0.88rem; line-height: 1.6; }
+    .guide-page-overview-shell { margin-top: 0.35rem; }
     .repo-preview-head { margin-bottom: 0.75rem; }
     .repo-preview-title { color: #1b3042; font-size: 0.92rem; font-weight: 700; margin-bottom: 0.2rem; }
     .repo-preview-desc { color: #667889; font-size: 0.84rem; line-height: 1.6; }
