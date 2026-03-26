@@ -164,3 +164,35 @@ def test_report_generator_falls_back_when_note_llm_is_missing() -> None:
     assert "# LabFlow 文献阅读笔记" in markdown
     assert "论文要点" in markdown
     assert "后续阅读建议" in markdown
+
+
+def test_report_generator_keeps_llm_path_for_large_note_batch() -> None:
+    """条目较多时仍应保留完整 LLM 笔记生成路径。"""
+
+    llm_client = FakeLiteratureNoteLLMClient()
+    entries = tuple(
+        ReadingNoteEntry(
+            paper_section_title=f"片段 {index}",
+            paper_section_content="The model builds a graph-aware navigation representation.",
+            paper_section_page_number=index,
+            paper_section_order=index,
+            alignment_result=build_result(
+                title=f"片段 {index}",
+                file_name="graph_utils.py",
+                score=0.75,
+                match_type="partial_match",
+                analysis="这段代码负责更新图结构并维护当前状态。",
+                suggestion="继续补充上下文，确认该实现是否覆盖完整机制。",
+            ),
+        )
+        for index in range(1, 6)
+    )
+
+    markdown = ReportGenerator().generate_literature_notes_markdown(
+        entries=entries,
+        llm_client=llm_client,
+        project_overview=(),
+    )
+
+    assert llm_client.calls == 1
+    assert "# LabFlow 文献阅读笔记" in markdown

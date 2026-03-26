@@ -315,6 +315,7 @@ def test_merge_learning_and_code_result_preserves_source_guide_fields() -> None:
 
     merged = agent._merge_learning_and_code_result(learning_result, code_result)
 
+    assert merged.analysis == learning_result.analysis
     assert merged.project_structure_context == code_result.project_structure_context
     assert merged.source_guide == code_result.source_guide
 

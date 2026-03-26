@@ -930,3 +930,123 @@ def test_local_fallback_result_uses_derived_focus_terms_and_prefers_mechanism_co
     assert result.code_file_name == "map_nav_src/models/graph_utils.py"
     assert result.code_start_line == 106
     assert result.code_end_line == 112
+
+
+def test_overview_section_prefers_model_level_candidate_over_local_helper() -> None:
+    """摘要/总览段应更偏向模型主干，而不是局部 helper。"""
+
+    section = PaperSection(
+        title="Abstract",
+        content=(
+            "In this work, we propose a dual-scale graph transformer for vision-and-language "
+            "navigation. Our model combines topological maps with fine-grained cross-modal "
+            "understanding and significantly outperforms prior methods on benchmark datasets."
+        ),
+        level=1,
+        page_number=1,
+        order=1,
+    )
+    model_evidence = CodeEvidence(
+        file_name="map_nav_src/models/vilmodel.py",
+        code_snippet=(
+            "class GlocalTextPathNavCMT(nn.Module):\n"
+            "    def forward_navigation_per_step(self, batch):\n"
+            "        return self.global_encoder(batch)\n"
+        ),
+        related_git_diff="",
+        symbols=("GlocalTextPathNavCMT", "forward_navigation_per_step", "global_encoder"),
+        commit_context=(),
+        start_line=430,
+        end_line=520,
+        symbol_name="GlocalTextPathNavCMT",
+        block_type="class",
+    )
+    helper_evidence = CodeEvidence(
+        file_name="map_nav_src/models/graph_utils.py",
+        code_snippet=(
+            "def update_graph(self, ob):\n"
+            "    self.graph.add_edge(ob['viewpoint'], ob['viewpoint'], 0)\n"
+        ),
+        related_git_diff="",
+        symbols=("update_graph", "add_edge"),
+        commit_context=(),
+        start_line=106,
+        end_line=112,
+        symbol_name="GraphMap.update_graph",
+        parent_symbol="GraphMap",
+        block_type="method",
+    )
+    agent = CodeGroundingAgent(_DummyLLMClient(), EvidenceBuilder(), _DummyEngine())
+
+    ranked = sorted(
+        (
+            AlignmentCandidate(section, helper_evidence, 1.9),
+            AlignmentCandidate(section, model_evidence, 1.2),
+        ),
+        key=lambda item: agent._candidate_sort_key(
+            item,
+            paper_section=section,
+            code_focus=agent._derive_focus_terms(section),
+        ),
+        reverse=True,
+    )
+
+    assert ranked[0].code_evidence.symbol_name == "GlocalTextPathNavCMT"
+
+
+def test_short_circuit_grounding_for_clear_topology_candidate() -> None:
+    """拓扑建图章节如果头部候选足够强，就应该直接短路收束。"""
+
+    section = PaperSection(
+        title="3.1 Topological Mapping",
+        content=(
+            "The model gradually builds its own map with visited nodes, navigable nodes "
+            "and the current node, then updates graph edges online."
+        ),
+        level=2,
+        page_number=3,
+        order=7,
+    )
+    strong_evidence = CodeEvidence(
+        file_name="map_nav_src/models/graph_utils.py",
+        code_snippet=(
+            "def update_graph(self, ob):\n"
+            "    self.node_positions[ob['viewpoint']] = ob['position']\n"
+            "    for cc in ob['candidate']:\n"
+            "        self.graph.add_edge(ob['viewpoint'], cc['viewpointId'], 0)\n"
+            "    self.graph.update(ob['viewpoint'])\n"
+        ),
+        related_git_diff="",
+        symbols=("update_graph", "add_edge", "node_positions"),
+        commit_context=(),
+        start_line=106,
+        end_line=118,
+        symbol_name="GraphMap.update_graph",
+        parent_symbol="GraphMap",
+        block_type="method",
+    )
+    weak_evidence = CodeEvidence(
+        file_name="map_nav_src/reverie/agent_obj.py",
+        code_snippet="def rollout(self):\n    return None\n",
+        related_git_diff="",
+        symbols=("rollout",),
+        commit_context=(),
+        start_line=30,
+        end_line=31,
+        symbol_name="GMapObjectNavAgent.rollout",
+        parent_symbol="GMapObjectNavAgent",
+        block_type="method",
+    )
+    agent = CodeGroundingAgent(_DummyLLMClient(), EvidenceBuilder(), _DummyEngine())
+
+    assert (
+        agent._should_short_circuit_grounding(
+            paper_section=section,
+            initial_candidates=(
+                AlignmentCandidate(section, strong_evidence, 2.8),
+                AlignmentCandidate(section, weak_evidence, 0.2),
+            ),
+            code_focus=("topological map", "visited nodes", "navigable nodes"),
+        )
+        is True
+    )

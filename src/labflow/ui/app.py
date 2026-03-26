@@ -40,7 +40,7 @@ from labflow.ui.styles import inject_styles
 
 EVIDENCE_BUILDER = EvidenceBuilder()
 REPORT_GENERATOR = ReportGenerator()
-ALIGNMENT_CACHE_VERSION = "learning-output-v23"
+ALIGNMENT_CACHE_VERSION = "learning-output-v24"
 __all__ = [
     "build_landing_paper_preview_state",
     "build_landing_quick_guide_state",
@@ -107,6 +107,7 @@ def init_session_state() -> None:
     st.session_state.setdefault("semantic_alignment_cache", {})
     st.session_state.setdefault("reading_note_history", {})
     st.session_state.setdefault("reading_note_markdown", "")
+    st.session_state.setdefault("reading_note_markdown_signature", "")
 
 
 def build_landing_repo_preview_state(repo_path: str) -> LandingRepoPreviewState:
@@ -312,23 +313,28 @@ def get_workspace_state() -> WorkspaceState:
         st.session_state["reading_note_history_signature"] = signature
         st.session_state["reading_note_history"] = {}
         st.session_state["reading_note_markdown"] = ""
+        st.session_state["reading_note_markdown_signature"] = ""
     sync_section_selection(workspace)
     return workspace
 
 
 def resolve_pdf_source() -> tuple[bytes | None, str | None]:
+    current_route = st.session_state.get("current_route", "landing")
     sidebar_bytes = st.session_state.get("sidebar_uploaded_pdf_bytes")
     sidebar_name = st.session_state.get("sidebar_uploaded_pdf_name")
-    if sidebar_bytes:
+    if current_route == "workspace" and sidebar_bytes:
         return sidebar_bytes, sidebar_name or "uploaded.pdf"
     return st.session_state.get("landing_pdf_bytes"), st.session_state.get("landing_pdf_name")
 
 
 def resolve_git_repo_path() -> str:
-    return (
-        st.session_state.get("sidebar_git_repo_path")
-        or st.session_state.get("landing_git_repo_path", "")
-    ).strip()
+    current_route = st.session_state.get("current_route", "landing")
+    if current_route == "workspace":
+        return (
+            st.session_state.get("sidebar_git_repo_path")
+            or st.session_state.get("landing_git_repo_path", "")
+        ).strip()
+    return st.session_state.get("landing_git_repo_path", "").strip()
 
 
 def build_workspace_signature(
@@ -442,7 +448,9 @@ def render_pdf_panel(workspace: WorkspaceState) -> PaperSection | None:
                 blocks=workspace.pdf_result.blocks if workspace.pdf_result is not None else (),
                 height=1180,
                 page_number=selected_section.page_number if selected_section else None,
-                selected_block_order=selected_section.order if selected_section else None,
+                selected_block_order=(
+                    get_selected_block_order(selected_section) if selected_section else None
+                ),
                 key="pdf_hotspot_viewer",
             )
         except RuntimeError as exc:
@@ -482,14 +490,25 @@ def format_section_label(section: PaperSection) -> str:
     preview = section.content.replace("\n", " ").strip()
     if len(preview) > 42:
         preview = preview[:42] + "..."
-    return f"P{section.page_number} · {section.title} · {preview}"
+    return f"P{section.page_number} | {section.title} | {preview}"
+
+
+def get_selected_block_order(section: PaperSection) -> int:
+    if section.block_orders:
+        return section.block_orders[0]
+    return section.order
+
+
+def build_section_identity(section: PaperSection) -> str:
+    block_key = "-".join(str(order) for order in section.block_orders)
+    return f"p{section.page_number}:o{section.order}:b{block_key}:{section.title}"
 
 
 def resolve_focus_section_index(sections: tuple[PaperSection, ...], block_order: int) -> int | None:
     for index, section in enumerate(sections):
-        if section.order == block_order:
-            return index
         if section.block_orders and block_order in section.block_orders:
+            return index
+        if section.order == block_order:
             return index
     return None
 
@@ -568,7 +587,10 @@ def get_semantic_alignment(
     runtime_settings: Settings,
     event_handler=None,
 ) -> AlignmentResult | None:
-    cache_key = f"{ALIGNMENT_CACHE_VERSION}:{workspace_signature}:{selected_section.order}"
+    cache_key = (
+        f"{ALIGNMENT_CACHE_VERSION}:{workspace_signature}:"
+        f"{build_section_identity(selected_section)}"
+    )
     cached_result = st.session_state["semantic_alignment_cache"].get(cache_key)
     if cached_result is not None:
         if event_handler is not None:
@@ -710,16 +732,44 @@ def render_trace_tab(trace_events: list[dict]) -> None:
 def render_reading_note_tab(workspace: WorkspaceState, runtime_settings: Settings) -> None:
     entries = get_reading_note_entries()
     if not entries:
-        st.info("先在左侧点开几个论文片段，系统会把对应结果积累到这里。")
+        st.info("先在左侧点开几个论文片段，系统会把对应结果累积到这里。")
         return
 
     st.caption(f"当前已记录 {len(entries)} 个已读片段与对应代码。")
     if st.button("生成阅读笔记", use_container_width=True):
-        st.session_state["reading_note_markdown"] = generate_reading_note_markdown(
+        note_signature = build_reading_note_markdown_signature(
+            workspace_signature=st.session_state.get("workspace_signature", ""),
             entries=entries,
-            workspace=workspace,
-            runtime_settings=runtime_settings,
         )
+        cached_markdown = st.session_state.get("reading_note_markdown", "").strip()
+        if (
+            cached_markdown
+            and st.session_state.get("reading_note_markdown_signature") == note_signature
+        ):
+            st.info("当前阅读笔记已经是最新版本，直接复用上次结果。")
+        else:
+            status_placeholder = st.empty()
+            progress_bar = st.progress(0, text="正在整理已读片段...")
+            try:
+                with status_placeholder.container():
+                    status = st.status("正在生成阅读笔记...", expanded=True)
+                    status.write("1. 整理已读片段")
+                    progress_bar.progress(20, text="已整理已读片段，正在准备模型客户端...")
+                    status.write("2. 初始化模型客户端")
+                    progress_bar.progress(40, text="模型客户端已就绪，开始生成阅读笔记...")
+                    st.session_state["reading_note_markdown"] = generate_reading_note_markdown(
+                        entries=entries,
+                        workspace=workspace,
+                        runtime_settings=runtime_settings,
+                    )
+                    st.session_state["reading_note_markdown_signature"] = note_signature
+                    status.write("3. 整理最终 Markdown")
+                    progress_bar.progress(90, text="正在整理最终 Markdown...")
+                    status.update(label="阅读笔记生成完成", state="complete")
+                    progress_bar.progress(100, text="阅读笔记已生成完成")
+            finally:
+                status_placeholder.empty()
+                progress_bar.empty()
 
     markdown = st.session_state.get("reading_note_markdown", "").strip()
     if markdown:
@@ -752,7 +802,7 @@ def record_reading_note_entry(
         return
 
     history: dict[str, ReadingNoteEntry] = st.session_state["reading_note_history"]
-    history[f"{workspace_signature}:{selected_section.order}"] = ReadingNoteEntry(
+    history[f"{workspace_signature}:{build_section_identity(selected_section)}"] = ReadingNoteEntry(
         paper_section_title=selected_section.title,
         paper_section_content=selected_section.content,
         paper_section_page_number=selected_section.page_number,
@@ -760,6 +810,7 @@ def record_reading_note_entry(
         alignment_result=alignment_result,
     )
     st.session_state["reading_note_markdown"] = ""
+    st.session_state["reading_note_markdown_signature"] = ""
 
 
 def get_reading_note_entries() -> tuple[ReadingNoteEntry, ...]:
@@ -767,9 +818,39 @@ def get_reading_note_entries() -> tuple[ReadingNoteEntry, ...]:
     return tuple(
         sorted(
             history.values(),
-            key=lambda item: (item.paper_section_order, item.paper_section_page_number),
+            key=lambda item: (
+                item.paper_section_page_number,
+                item.paper_section_order,
+                item.paper_section_title,
+            ),
         )
     )
+
+
+def build_reading_note_markdown_signature(
+    *,
+    workspace_signature: str,
+    entries: tuple[ReadingNoteEntry, ...],
+) -> str:
+    parts = [workspace_signature]
+    for entry in entries:
+        result = entry.alignment_result
+        parts.append(
+            "::".join(
+                (
+                    entry.paper_section_title,
+                    str(entry.paper_section_page_number),
+                    str(entry.paper_section_order),
+                    entry.paper_section_content,
+                    result.code_file_name,
+                    str(result.code_start_line),
+                    str(result.code_end_line),
+                    result.analysis,
+                    result.implementation_chain,
+                )
+            )
+        )
+    return "\n".join(parts)
 
 
 def build_reading_note_project_overview(

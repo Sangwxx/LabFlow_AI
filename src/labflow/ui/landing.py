@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from html import escape
 
 import streamlit as st
@@ -14,7 +14,7 @@ from labflow.ui.repo_preview import LandingRepoPreview, build_repo_preview_html
 
 @dataclass(frozen=True)
 class LandingPaperPreviewState:
-    """首页论文信息卡的运行时状态。"""
+    """首页论文信息卡片的运行时状态。"""
 
     preview: LandingPaperPreview | None = None
     hint: str | None = None
@@ -26,6 +26,16 @@ class LandingRepoPreviewState:
 
     preview: LandingRepoPreview | None = None
     hint: str | None = None
+
+
+@dataclass(frozen=True)
+class LandingPdfCardState:
+    """首页论文上传卡片的稳定输出。"""
+
+    pdf_bytes: bytes | None = None
+    pdf_name: str | None = None
+    preview_state: LandingPaperPreviewState = field(default_factory=LandingPaperPreviewState)
+    upload_hint: str | None = None
 
 
 def render_landing(
@@ -44,7 +54,7 @@ def render_landing(
         )
 
         pdf_column, git_column = st.columns(2, gap="medium")
-        uploaded_pdf = _render_pdf_input_card(
+        pdf_card_state = _render_pdf_input_card(
             pdf_column,
             has_pdf=has_pdf,
             paper_preview_resolver=paper_preview_resolver,
@@ -55,11 +65,13 @@ def render_landing(
             repo_preview_resolver=repo_preview_resolver,
         )
 
-        if uploaded_pdf is not None:
-            st.session_state["landing_pdf_bytes"] = uploaded_pdf.getvalue()
-            st.session_state["landing_pdf_name"] = uploaded_pdf.name
+        if pdf_card_state.pdf_bytes is not None and pdf_card_state.pdf_name:
+            st.session_state["landing_pdf_bytes"] = pdf_card_state.pdf_bytes
+            st.session_state["landing_pdf_name"] = pdf_card_state.pdf_name
         st.session_state["landing_git_repo_path"] = git_repo_path
 
+        has_pdf = bool(st.session_state.get("landing_pdf_bytes"))
+        has_repo_path = bool(st.session_state.get("landing_git_repo_path", "").strip())
         _render_quick_guide_entry()
         _render_landing_action(has_pdf=has_pdf, has_repo_path=has_repo_path)
 
@@ -69,14 +81,17 @@ def _render_pdf_input_card(
     *,
     has_pdf: bool,
     paper_preview_resolver: Callable[[bytes | None, str | None], LandingPaperPreviewState] | None,
-):
+) -> LandingPdfCardState:
+    stored_pdf_bytes = st.session_state.get("landing_pdf_bytes")
+    stored_pdf_name = st.session_state.get("landing_pdf_name")
+
     with column:
         with st.container(border=True):
             st.markdown(
                 build_landing_entry_header_html(
                     step_label="步骤 1",
                     title="论文 PDF",
-                    description="上传后即可开始按段落阅读。",
+                    description="上传后即可开始按段阅读。",
                     status_text="已选择" if has_pdf else "未选择",
                     status_tone="ready" if has_pdf else "pending",
                 ),
@@ -88,31 +103,60 @@ def _render_pdf_input_card(
                 key="landing_pdf_uploader",
                 label_visibility="collapsed",
             )
-            current_pdf_name = (
-                uploaded_pdf.name
-                if uploaded_pdf is not None
-                else st.session_state.get("landing_pdf_name")
-            )
+
+            current_pdf_bytes = stored_pdf_bytes
+            current_pdf_name = stored_pdf_name
+            upload_hint = None
+
+            if uploaded_pdf is not None:
+                current_pdf_name = uploaded_pdf.name
+                current_pdf_bytes, upload_hint = _read_uploaded_pdf(uploaded_pdf)
+                if current_pdf_bytes is None:
+                    current_pdf_bytes = stored_pdf_bytes
+                    current_pdf_name = stored_pdf_name
+
             if current_pdf_name:
                 st.caption(f"当前文件：`{current_pdf_name}`")
-            current_pdf_bytes = (
-                uploaded_pdf.getvalue()
-                if uploaded_pdf is not None
-                else st.session_state.get("landing_pdf_bytes")
-            )
-            paper_preview_state = (
-                paper_preview_resolver(current_pdf_bytes, current_pdf_name)
-                if paper_preview_resolver is not None
-                else LandingPaperPreviewState()
-            )
+
+            paper_preview_state = LandingPaperPreviewState()
+            if current_pdf_bytes and current_pdf_name and paper_preview_resolver is not None:
+                try:
+                    paper_preview_state = paper_preview_resolver(
+                        current_pdf_bytes, current_pdf_name
+                    )
+                except Exception:  # noqa: BLE001
+                    paper_preview_state = LandingPaperPreviewState(
+                        hint="论文已上传，预览暂时不可用，可直接进入工作区继续阅读。"
+                    )
+
             if paper_preview_state.preview is not None:
                 st.markdown(
                     build_paper_preview_html(paper_preview_state.preview),
                     unsafe_allow_html=True,
                 )
+            elif upload_hint:
+                st.caption(upload_hint)
             elif paper_preview_state.hint:
                 st.caption(paper_preview_state.hint)
-    return uploaded_pdf
+
+    return LandingPdfCardState(
+        pdf_bytes=current_pdf_bytes if uploaded_pdf is not None and upload_hint is None else None,
+        pdf_name=current_pdf_name if uploaded_pdf is not None and upload_hint is None else None,
+        preview_state=paper_preview_state,
+        upload_hint=upload_hint,
+    )
+
+
+def _read_uploaded_pdf(uploaded_pdf) -> tuple[bytes | None, str | None]:
+    """上传成功与预览成功解耦，避免预览失败污染首页上传状态。"""
+
+    try:
+        pdf_bytes = uploaded_pdf.getvalue()
+    except Exception:  # noqa: BLE001
+        return None, "论文上传失败，请重试；如果问题持续，请刷新页面后重新上传。"
+    if not pdf_bytes:
+        return None, "上传的 PDF 内容为空，请重新选择文件。"
+    return pdf_bytes, None
 
 
 def _render_repo_input_card(
@@ -197,7 +241,7 @@ def _render_quick_guide_entry() -> None:
             unsafe_allow_html=True,
         )
         if current_pdf_bytes and current_pdf_name:
-            st.caption("导读页会先讲清楚论文在解决什么、方法核心是什么，以及接下来该怎么看。")
+            st.caption("导读页会先讲清论文在解决什么、方法核心是什么，以及接下来该怎么读。")
         else:
             st.caption("可以先进入导读页看结构，上传论文后会显示完整导读内容。")
         if st.button("进入导读页", key="landing_quick_guide_entry", use_container_width=False):

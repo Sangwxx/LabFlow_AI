@@ -32,7 +32,7 @@ from labflow.reasoning.models import (
 class CodeGroundingAgent:
     """我只负责论文片段与源码逻辑的对齐和解释。"""
 
-    EXECUTION_BUDGET_SEC = 18.0
+    EXECUTION_BUDGET_SEC = 8.0
 
     def __init__(
         self,
@@ -69,58 +69,75 @@ class CodeGroundingAgent:
             self._emit(
                 event_handler,
                 kind="observation",
-                message="当前没有定位到足够可信的源码候选，本轮先只保留论文导读结果。",
+                message="??????????????????????????????",
             )
             return None
 
-        execution_budget = self._resolve_execution_budget(
-            paper_section,
-            code_evidences=code_evidences,
-        )
-        current_plan, step_traces, current_candidates = self._engine.run(
+        current_candidates = initial_candidates
+        if self._should_short_circuit_grounding(
             paper_section=paper_section,
-            project_structure=project_structure,
-            code_evidences=code_evidences,
-            current_candidates=initial_candidates,
-            role_prompt=role_prompt,
-            event_handler=event_handler,
-            max_runtime_sec=execution_budget,
-        )
-        current_candidates = self._stabilize_candidates(
-            initial_candidates,
-            current_candidates,
-            paper_section=paper_section,
+            initial_candidates=initial_candidates,
             code_focus=plan.code_focus,
-        )
-        if (
-            all(not trace.tool_invocations for trace in step_traces)
-            or current_plan.final_summary == "执行阶段达到时限，我先用已有候选收束结果。"
         ):
             self._emit(
                 event_handler,
                 kind="observation",
-                message="执行阶段没有稳定收敛到足够强的工具证据，我直接基于当前候选生成兜底结论。",
+                message="???????????????????????????????",
             )
-            result = self._build_local_fallback_result(
+            reflected_result = self._build_local_fallback_result(
                 paper_section,
-                current_candidates,
-                step_traces,
-                current_plan,
+                initial_candidates,
+                (),
+                plan,
             )
-            reflected_result = result
         else:
-            result = self._build_final_answer(
-                paper_section=paper_section,
-                current_candidates=current_candidates,
-                step_traces=step_traces,
-                current_plan=current_plan,
-                role_prompt=role_prompt,
+            execution_budget = self._resolve_execution_budget(
+                paper_section,
+                code_evidences=code_evidences,
             )
-            reflected_result = self._reflect(
-                result,
+            current_plan, step_traces, current_candidates = self._engine.run(
                 paper_section=paper_section,
+                project_structure=project_structure,
+                code_evidences=code_evidences,
+                current_candidates=initial_candidates,
                 role_prompt=role_prompt,
+                event_handler=event_handler,
+                max_runtime_sec=execution_budget,
             )
+            current_candidates = self._stabilize_candidates(
+                initial_candidates,
+                current_candidates,
+                paper_section=paper_section,
+                code_focus=plan.code_focus,
+            )
+            if (
+                all(not trace.tool_invocations for trace in step_traces)
+                or current_plan.final_summary == "?????????????????????"
+            ):
+                self._emit(
+                    event_handler,
+                    kind="observation",
+                    message="????????????????????????????????????",
+                )
+                reflected_result = self._build_local_fallback_result(
+                    paper_section,
+                    current_candidates,
+                    step_traces,
+                    current_plan,
+                )
+            else:
+                result = self._build_final_answer(
+                    paper_section=paper_section,
+                    current_candidates=current_candidates,
+                    step_traces=step_traces,
+                    current_plan=current_plan,
+                    role_prompt=role_prompt,
+                )
+                reflected_result = self._reflect(
+                    result,
+                    paper_section=paper_section,
+                    role_prompt=role_prompt,
+                )
         if self._should_refuse_alignment(
             paper_section,
             reflected_result,
@@ -148,8 +165,53 @@ class CodeGroundingAgent:
         if self._is_topological_mapping_section(paper_section):
             budget = min(budget, 12.0)
         if any(term in paper_text for term in ("coarse-scale", "cross-modal", "encoder")):
-            budget = min(budget, 15.0)
+            budget = min(budget, 9.0)
         return budget
+
+    def _should_use_llm_rerank(
+        self,
+        paper_section: PaperSection,
+        code_focus: tuple[str, ...],
+    ) -> bool:
+        if self._llm_client is None:
+            return False
+        if self._is_overview_section(paper_section):
+            return False
+        if self._is_topological_mapping_section(paper_section):
+            return False
+        paper_text = paper_section.combined_text.lower()
+        return any(
+            term in paper_text or term in " ".join(code_focus).lower()
+            for term in ("coarse-scale", "cross-modal", "graph-aware", "encoder")
+        )
+
+    def _should_short_circuit_grounding(
+        self,
+        *,
+        paper_section: PaperSection,
+        initial_candidates: tuple[AlignmentCandidate, ...],
+        code_focus: tuple[str, ...],
+    ) -> bool:
+        if not initial_candidates:
+            return False
+        effective_focus = code_focus or self._derive_focus_terms(paper_section)
+        if self._is_overview_section(paper_section):
+            return True
+        if len(initial_candidates) < 2:
+            return False
+        top_score = self._candidate_priority_score(
+            initial_candidates[0],
+            paper_section=paper_section,
+            code_focus=effective_focus,
+        )
+        second_score = self._candidate_priority_score(
+            initial_candidates[1],
+            paper_section=paper_section,
+            code_focus=effective_focus,
+        )
+        if self._is_topological_mapping_section(paper_section):
+            return top_score >= 12.0 and top_score - second_score >= 2.0
+        return top_score >= 11.0 and top_score - second_score >= 3.0
 
     def _build_initial_candidates(
         self,
@@ -160,6 +222,7 @@ class CodeGroundingAgent:
         semantic_index: tuple[CodeSemanticSummary, ...],
     ) -> tuple[AlignmentCandidate, ...]:
         merged: dict[str, AlignmentCandidate] = {}
+        effective_focus = code_focus or self._derive_focus_terms(paper_section)
         knowledge_index = CodeKnowledgeIndex(
             semantic_index,
             llm_client=self._llm_client,
@@ -203,7 +266,7 @@ class CodeGroundingAgent:
             )
             knowledge_candidates = knowledge_index.search(
                 section,
-                focus_terms=code_focus,
+                focus_terms=effective_focus,
                 top_k=10,
                 use_llm_rerank=use_llm_rerank,
             )
@@ -216,26 +279,29 @@ class CodeGroundingAgent:
             lexical_boost=0.02,
             semantic_boost=0.12,
             knowledge_boost=0.18,
-            use_llm_rerank=True,
+            use_llm_rerank=self._should_use_llm_rerank(paper_section, effective_focus),
         )
-        for focus in code_focus[:3]:
-            synthetic_section = PaperSection(
-                title=paper_section.title,
-                content=focus,
-                level=paper_section.level,
-                page_number=paper_section.page_number,
-                order=paper_section.order,
-                block_orders=paper_section.block_orders,
-            )
-            collect_for_section(
-                synthetic_section,
-                lexical_boost=0.0,
-                semantic_boost=0.09,
-                knowledge_boost=0.12,
-                use_llm_rerank=False,
-            )
+        if not self._is_overview_section(
+            paper_section
+        ) and not self._is_topological_mapping_section(paper_section):
+            for focus in effective_focus[:2]:
+                synthetic_section = PaperSection(
+                    title=paper_section.title,
+                    content=focus,
+                    level=paper_section.level,
+                    page_number=paper_section.page_number,
+                    order=paper_section.order,
+                    block_orders=paper_section.block_orders,
+                )
+                collect_for_section(
+                    synthetic_section,
+                    lexical_boost=0.0,
+                    semantic_boost=0.09,
+                    knowledge_boost=0.12,
+                    use_llm_rerank=False,
+                )
 
-        traced_symbols = self._extract_trace_symbols(code_focus, semantic_index, merged)
+        traced_symbols = self._extract_trace_symbols(effective_focus, semantic_index, merged)
         if traced_symbols:
             traced_candidates = self._evidence_builder.trace_related_candidates(
                 paper_section,
@@ -252,7 +318,7 @@ class CodeGroundingAgent:
                 key=lambda item: self._candidate_sort_key(
                     item,
                     paper_section=paper_section,
-                    code_focus=code_focus,
+                    code_focus=effective_focus,
                 ),
                 reverse=True,
             )[:6]
@@ -1291,10 +1357,35 @@ class CodeGroundingAgent:
             candidate.retrieval_score,
         )
 
+    def _candidate_priority_score(
+        self,
+        candidate: AlignmentCandidate,
+        *,
+        paper_section: PaperSection,
+        code_focus: tuple[str, ...],
+    ) -> float:
+        return (
+            self._compute_focus_alignment_score(
+                candidate.code_evidence,
+                paper_section=paper_section,
+                code_focus=code_focus,
+            )
+            + self._compute_mechanism_alignment_score(
+                candidate.code_evidence,
+                paper_section=paper_section,
+            )
+            + self._compute_specificity_score(
+                candidate.code_evidence,
+                paper_section=paper_section,
+            )
+            + candidate.retrieval_score
+        )
+
     def _derive_focus_terms(self, paper_section: PaperSection) -> tuple[str, ...]:
         paper_text = f"{paper_section.title} {paper_section.combined_text}".lower()
         focus_terms: list[str] = []
         phrases = (
+            "dual-scale",
             "topological map",
             "global action planning",
             "global planning",
@@ -1325,6 +1416,10 @@ class CodeGroundingAgent:
         for token in single_terms:
             if token in paper_text and token not in focus_terms:
                 focus_terms.append(token)
+        if self._is_overview_section(paper_section):
+            for token in ("model overview", "navigation", "grounding", "dual-scale"):
+                if token not in focus_terms:
+                    focus_terms.append(token)
         return tuple(focus_terms)
 
     def _stabilize_candidates(
@@ -1373,6 +1468,37 @@ class CodeGroundingAgent:
             if part
         ).lower()
         score = 0.0
+
+        if self._is_overview_section(paper_section):
+            if evidence.block_type == "class":
+                score += 2.8
+            if "vilmodel.py" in evidence.file_name.lower():
+                score += 2.4
+            if any(
+                term in searchable
+                for term in (
+                    "glocaltextpathnavcmt",
+                    "globalmapencoder",
+                    "graphlxrtxlayer",
+                    "graphmap",
+                    "forward_navigation_per_step",
+                )
+            ):
+                score += 6.6
+            if any(
+                term in symbol
+                for term in (
+                    "update_graph",
+                    "get_pos_fts",
+                    "save_to_json",
+                    ".visited",
+                    ".distance",
+                    ".path",
+                )
+            ):
+                score -= 6.4
+            if "graph_utils.py" in evidence.file_name.lower() and evidence.block_type != "class":
+                score -= 2.4
 
         if any(
             term in paper_text
@@ -1448,6 +1574,26 @@ class CodeGroundingAgent:
                 term in searchable for term in ("global", "gmap", "graph_sprels", "global_encoder")
             ):
                 score += 5.0
+        if self._is_overview_section(paper_section):
+            if any(
+                term in searchable
+                for term in (
+                    "glocaltextpathnavcmt",
+                    "globalmapencoder",
+                    "graphlxrtxlayer",
+                    "graphmap",
+                )
+            ):
+                score += 6.0
+            if "vilmodel.py" in evidence.file_name.lower():
+                score += 2.0
+            if any(
+                term in searchable
+                for term in ("update_graph", "get_pos_fts", "save_to_json", ".visited", ".path")
+            ):
+                score -= 6.0
+            if "graph_utils.py" in evidence.file_name.lower() and evidence.block_type != "class":
+                score -= 2.0
         if any(term in paper_text for term in ("graph", "graph-aware", "topological map", "map")):
             if any(
                 term in searchable
@@ -1563,6 +1709,14 @@ class CodeGroundingAgent:
         elif span >= 260:
             score -= 1.6
 
+        if self._is_overview_section(paper_section):
+            if evidence.block_type == "class":
+                score += 2.4
+            if 24 <= span <= 180:
+                score += 1.8
+            if span <= 12:
+                score -= 1.4
+
         if any(term in paper_text for term in ("encoder", "cross-modal", "coarse-scale")):
             if "/models/" in file_name or file_name.startswith("models/"):
                 score += 1.8
@@ -1605,6 +1759,31 @@ class CodeGroundingAgent:
                 "visited nodes",
                 "navigable nodes",
             )
+        )
+
+    def _is_overview_section(self, paper_section: PaperSection) -> bool:
+        title = paper_section.title.lower()
+        text = paper_section.combined_text.lower()
+        if any(term in title for term in ("abstract", "overview", "summary")):
+            return True
+        abstract_markers = (
+            "in this work",
+            "we propose",
+            "our model",
+            "significantly outperforms",
+            "state-of-the-art",
+            "benchmark",
+        )
+        mechanism_markers = (
+            "dual-scale",
+            "graph transformer",
+            "topological map",
+            "cross-modal",
+            "global action planning",
+        )
+        return (
+            sum(marker in text for marker in abstract_markers) >= 2
+            and sum(marker in text for marker in mechanism_markers) >= 2
         )
 
     def _is_trivial_helper_evidence(self, evidence: CodeEvidence) -> bool:

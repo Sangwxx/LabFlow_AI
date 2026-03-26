@@ -3,6 +3,7 @@
 import streamlit as st
 
 import labflow.ui.app as app_module
+import labflow.ui.landing as landing_module
 from labflow.config.settings import Settings
 from labflow.reasoning.models import AlignmentResult, PaperSection, SourceGuideItem
 from labflow.ui.app import (
@@ -12,6 +13,7 @@ from labflow.ui.app import (
     build_landing_quick_guide_state,
     build_landing_readiness_text,
     build_landing_repo_preview_state,
+    build_reading_note_markdown_signature,
     build_reading_note_project_overview,
     build_source_overview_html,
     generate_reading_note_markdown,
@@ -426,6 +428,120 @@ def test_resolve_focus_section_index_supports_merged_block_orders() -> None:
     assert resolve_focus_section_index(sections, 99) is None
 
 
+def test_record_reading_note_entry_uses_stable_section_identity() -> None:
+    """不同块来源的片段不应因为 order 相同而互相覆盖。"""
+
+    st.session_state.clear()
+    st.session_state["reading_note_history"] = {}
+    st.session_state["reading_note_markdown"] = ""
+
+    section_a = PaperSection(
+        title="Abstract",
+        content="We propose a dual-scale graph transformer.",
+        level=1,
+        page_number=1,
+        order=1,
+        block_orders=(1, 2, 3),
+    )
+    section_b = PaperSection(
+        title="3.1 Topological Mapping",
+        content="The map is built online during navigation.",
+        level=1,
+        page_number=3,
+        order=1,
+        block_orders=(21, 22),
+    )
+    result = build_result(
+        title="Abstract",
+        file_name="graph_utils.py",
+        score=0.7,
+        match_type="partial_match",
+        analysis="中文译文",
+        suggestion="继续核对实现。",
+    )
+
+    record_reading_note_entry("workspace", section_a, result)
+    record_reading_note_entry("workspace", section_b, result)
+
+    assert len(st.session_state["reading_note_history"]) == 2
+
+
+def test_resolve_pdf_source_prefers_landing_source_outside_workspace() -> None:
+    """首页和导读页不应被侧边栏旧 PDF 状态污染。"""
+
+    st.session_state.clear()
+    st.session_state["current_route"] = "landing"
+    st.session_state["landing_pdf_bytes"] = b"landing-pdf"
+    st.session_state["landing_pdf_name"] = "landing.pdf"
+    st.session_state["sidebar_uploaded_pdf_bytes"] = b"sidebar-pdf"
+    st.session_state["sidebar_uploaded_pdf_name"] = "sidebar.pdf"
+
+    assert app_module.resolve_pdf_source() == (b"landing-pdf", "landing.pdf")
+
+    st.session_state["current_route"] = "workspace"
+
+    assert app_module.resolve_pdf_source() == (b"sidebar-pdf", "sidebar.pdf")
+
+
+def test_resolve_git_repo_path_prefers_landing_path_outside_workspace() -> None:
+    """首页和导读页的代码路径应只使用 landing 源。"""
+
+    st.session_state.clear()
+    st.session_state["current_route"] = "quick_guide"
+    st.session_state["landing_git_repo_path"] = r"E:\landing-repo"
+    st.session_state["sidebar_git_repo_path"] = r"E:\sidebar-repo"
+
+    assert app_module.resolve_git_repo_path() == r"E:\landing-repo"
+
+    st.session_state["current_route"] = "workspace"
+
+    assert app_module.resolve_git_repo_path() == r"E:\sidebar-repo"
+
+
+def test_build_reading_note_markdown_signature_tracks_alignment_changes() -> None:
+    """同一批片段只要对齐结果变了，就必须重新生成阅读笔记。"""
+
+    entry_a = app_module.ReadingNoteEntry(
+        paper_section_title="3.1 Topological Mapping",
+        paper_section_content="The map is built online during navigation.",
+        paper_section_page_number=3,
+        paper_section_order=12,
+        alignment_result=build_result(
+            title="3.1 Topological Mapping",
+            file_name="graph_utils.py",
+            score=0.81,
+            match_type="strong_match",
+            analysis="这段代码负责更新图结构。",
+            suggestion="继续核对调用链。",
+        ),
+    )
+    entry_b = app_module.ReadingNoteEntry(
+        paper_section_title="3.1 Topological Mapping",
+        paper_section_content="The map is built online during navigation.",
+        paper_section_page_number=3,
+        paper_section_order=12,
+        alignment_result=build_result(
+            title="3.1 Topological Mapping",
+            file_name="graph_utils.py",
+            score=0.81,
+            match_type="strong_match",
+            analysis="这段代码负责更新图结构，并同步候选节点状态。",
+            suggestion="继续核对调用链。",
+        ),
+    )
+
+    signature_a = build_reading_note_markdown_signature(
+        workspace_signature="workspace",
+        entries=(entry_a,),
+    )
+    signature_b = build_reading_note_markdown_signature(
+        workspace_signature="workspace",
+        entries=(entry_b,),
+    )
+
+    assert signature_a != signature_b
+
+
 def test_source_grounding_shows_for_viable_grounding_result() -> None:
     """只要拿到可读的源码解释，源码导览就应显示。"""
 
@@ -540,3 +656,19 @@ def test_build_api_key_status_does_not_require_echoing_secret() -> None:
         == "当前会话已应用手动输入的 API Key，页面不会回显具体值。"
     )
     assert _build_api_key_status(has_env_api_key=False, has_session_override=False) is None
+
+
+def test_read_uploaded_pdf_rejects_empty_payload() -> None:
+    """?????????????????????????"""
+
+    class EmptyUploadedPdf:
+        name = "demo.pdf"
+
+        @staticmethod
+        def getvalue() -> bytes:
+            return b""
+
+    pdf_bytes, hint = landing_module._read_uploaded_pdf(EmptyUploadedPdf())
+
+    assert pdf_bytes is None
+    assert hint == "上传的 PDF 内容为空，请重新选择文件。"
