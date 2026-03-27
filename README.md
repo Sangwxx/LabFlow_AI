@@ -163,6 +163,7 @@ docker run --rm -p 8501:8501 --env-file .env -v E:\Projects:/workspace/repos lab
 
 为了方便比赛评委快速复现，我们在仓库里额外放了一套固定演示样例：
 
+- 演示视频：[LabFlow 一体化科研助手（哔哩哔哩）](https://b23.tv/smNdUX4)
 - `demo_assets/paper/Think.pdf`
 - `demo_assets/code/VLN-DUET-main/`
 
